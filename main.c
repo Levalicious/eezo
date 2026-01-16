@@ -11,6 +11,7 @@
 #include <libeezo/term.h>
 #include <libeezo/bcl.h>
 #include <libeezo/jomplement.h>
+#include <libeezo/native.h>
 #include "stg.h"
 
 /* Input format */
@@ -27,6 +28,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -f FORMAT     Input format: bcl (default), jot, jomplement\n");
     fprintf(stderr, "  -o FORMAT     Output format: bcl (default), jot, jomplement, ski\n");
     fprintf(stderr, "  -s            Use simple interpreter (default: STG machine)\n");
+    fprintf(stderr, "  -n            Use native JIT (x86_64)\n");
     fprintf(stderr, "  -v            Verbose output\n");
     fprintf(stderr, "  -h            Show this help\n");
     fprintf(stderr, "\nInput is ASCII '0'/'1' bits read from stdin.\n");
@@ -142,6 +144,7 @@ int main(int argc, char **argv) {
     Format in_fmt = FMT_BCL;
     Format out_fmt = FMT_BCL;
     int use_simple = 0;
+    int use_native = 0;
     int verbose = 0;
     int out_ski = 0;
     
@@ -154,6 +157,8 @@ int main(int argc, char **argv) {
             verbose = 1;
         } else if (strcmp(argv[i], "-s") == 0) {
             use_simple = 1;
+        } else if (strcmp(argv[i], "-n") == 0) {
+            use_native = 1;
         } else if (strcmp(argv[i], "-f") == 0) {
             if (++i >= argc) {
                 fprintf(stderr, "Missing argument for -f\n");
@@ -248,7 +253,57 @@ int main(int argc, char **argv) {
     i64 steps;
     SKITerm *result;
     
-    if (use_simple) {
+    if (use_native) {
+        if (verbose) fprintf(stderr, "Using native JIT...\n");
+        
+        /* Allocate code buffer */
+        u32 code_cap = 64 * 1024;
+        u8 *code_buf = malloc(code_cap);
+        if (!code_buf) {
+            fprintf(stderr, "Out of memory\n");
+            pool_free(&pool);
+            return 1;
+        }
+        
+        /* Initialize and emit runtime */
+        NativeEmit e;
+        native_emit_init(&e, code_buf, code_cap, OUTPUT_BCL);
+        native_emit_runtime(&e);
+        
+        /* Prepare JIT */
+        NativeJIT *jit = native_jit_prepare(&e, 16 * 1024 * 1024);
+        if (!jit) {
+            fprintf(stderr, "JIT preparation failed\n");
+            free(code_buf);
+            pool_free(&pool);
+            return 1;
+        }
+        
+        /* Load term onto heap */
+        if (native_jit_load_term(jit, term) != 0) {
+            fprintf(stderr, "Term too large for heap\n");
+            native_jit_free(jit);
+            free(code_buf);
+            pool_free(&pool);
+            return 1;
+        }
+        
+        /* Run - forks, child executes and exits */
+        int exit_status = native_jit_run(jit);
+        
+        if (verbose) {
+            fprintf(stderr, "Native JIT exited with status %d\n", exit_status);
+        }
+        
+        native_jit_free(jit);
+        free(code_buf);
+        ski_unref(&pool, term);
+        pool_free(&pool);
+        
+        /* Native JIT handles its own output, we just return the exit status */
+        return exit_status;
+        
+    } else if (use_simple) {
         if (verbose) fprintf(stderr, "Using simple interpreter...\n");
         steps = ski_reduce(&pool, &term, 0);
         result = term;
