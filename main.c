@@ -25,8 +25,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s [options] < input\n", prog);
     fprintf(stderr, "\nEezo evaluator - executes pre-compiled SKI programs\n");
     fprintf(stderr, "\nOptions:\n");
-    fprintf(stderr, "  -f FORMAT     Input format: bcl (default), jot, jomplement\n");
-    fprintf(stderr, "  -o FORMAT     Output format: bcl (default), jot, jomplement, ski\n");
+    fprintf(stderr, "  -f FORMAT     Format: bcl (default), jot, jomplement\n");
     fprintf(stderr, "  -s            Use simple interpreter (default: STG machine)\n");
     fprintf(stderr, "  -n            Use native JIT (x86_64)\n");
     fprintf(stderr, "  -v            Verbose output\n");
@@ -141,12 +140,10 @@ static void output_result(SKITerm *term, Format fmt) {
 }
 
 int main(int argc, char **argv) {
-    Format in_fmt = FMT_BCL;
-    Format out_fmt = FMT_BCL;
+    Format fmt = FMT_BCL;
     int use_simple = 0;
     int use_native = 0;
     int verbose = 0;
-    int out_ski = 0;
     
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
@@ -165,28 +162,11 @@ int main(int argc, char **argv) {
                 return 1;
             }
             if (strcmp(argv[i], "bcl") == 0) {
-                in_fmt = FMT_BCL;
+                fmt = FMT_BCL;
             } else if (strcmp(argv[i], "jot") == 0) {
-                in_fmt = FMT_JOT;
+                fmt = FMT_JOT;
             } else if (strcmp(argv[i], "jomplement") == 0) {
-                in_fmt = FMT_JOMPLEMENT;
-            } else {
-                fprintf(stderr, "Unknown format: %s\n", argv[i]);
-                return 1;
-            }
-        } else if (strcmp(argv[i], "-o") == 0) {
-            if (++i >= argc) {
-                fprintf(stderr, "Missing argument for -o\n");
-                return 1;
-            }
-            if (strcmp(argv[i], "bcl") == 0) {
-                out_fmt = FMT_BCL;
-            } else if (strcmp(argv[i], "jot") == 0) {
-                out_fmt = FMT_JOT;
-            } else if (strcmp(argv[i], "jomplement") == 0) {
-                out_fmt = FMT_JOMPLEMENT;
-            } else if (strcmp(argv[i], "ski") == 0) {
-                out_ski = 1;
+                fmt = FMT_JOMPLEMENT;
             } else {
                 fprintf(stderr, "Unknown format: %s\n", argv[i]);
                 return 1;
@@ -220,7 +200,7 @@ int main(int argc, char **argv) {
     bcl_stream_init(&s, bits, nbits);
     
     SKITerm *term = NULL;
-    switch (in_fmt) {
+    switch (fmt) {
     case FMT_BCL:
         term = bcl_parse(&pool, &s);
         if (verbose) fprintf(stderr, "Parsed BCL\n");
@@ -267,7 +247,10 @@ int main(int argc, char **argv) {
         
         /* Initialize and emit runtime */
         NativeEmit e;
-        native_emit_init(&e, code_buf, code_cap, OUTPUT_BCL);
+        OutputFormat native_fmt = OUTPUT_BCL;
+        if (fmt == FMT_JOT) native_fmt = OUTPUT_JOT;
+        else if (fmt == FMT_JOMPLEMENT) native_fmt = OUTPUT_JOMPLEMENT;
+        native_emit_init(&e, code_buf, code_cap, native_fmt);
         native_emit_runtime(&e);
         
         /* Prepare JIT */
@@ -321,12 +304,7 @@ int main(int argc, char **argv) {
     }
     
     /* Output result */
-    if (out_ski) {
-        ski_fprint(stdout, result);
-        printf("\n");
-    } else {
-        output_result(result, out_fmt);
-    }
+    output_result(result, fmt);
     
     ski_unref(&pool, result);
     pool_free(&pool);
