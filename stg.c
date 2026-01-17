@@ -96,6 +96,10 @@ typedef struct STG {
     /* GC statistics */
     u64 gc_count;
     u64 bytes_copied;
+    
+    /* Reduction step counter and optional bound */
+    i64 steps;
+    i64 max_steps;  /* 0 = unlimited */
 } STG;
 
 static STG *g_stg = NULL;
@@ -236,6 +240,10 @@ static Closure *entry_S(STG *stg, Closure *self) {
     }
     
     /* Have 3 args: S x y z → x z (y z) */
+    stg->steps++;
+    if (stg->max_steps && stg->steps >= stg->max_steps) {
+        longjmp(stg->exit_jmp, 2);  /* step limit exceeded */
+    }
     Closure *x = stg_pop(stg);
     Closure *y = stg_pop(stg);
     Closure *z = stg_pop(stg);
@@ -274,6 +282,10 @@ static Closure *entry_S1(STG *stg, Closure *self) {
         }
     }
     
+    stg->steps++;
+    if (stg->max_steps && stg->steps >= stg->max_steps) {
+        longjmp(stg->exit_jmp, 2);
+    }
     Closure *x = self->payload.s1.x;
     Closure *y = stg_pop(stg);
     Closure *z = stg_pop(stg);
@@ -299,6 +311,10 @@ static Closure *entry_S2(STG *stg, Closure *self) {
         return self;
     }
     
+    stg->steps++;
+    if (stg->max_steps && stg->steps >= stg->max_steps) {
+        longjmp(stg->exit_jmp, 2);
+    }
     Closure *x = self->payload.s2.x;
     Closure *y = self->payload.s2.y;
     Closure *z = stg_pop(stg);
@@ -335,6 +351,10 @@ static Closure *entry_K(STG *stg, Closure *self) {
         }
     }
     
+    stg->steps++;
+    if (stg->max_steps && stg->steps >= stg->max_steps) {
+        longjmp(stg->exit_jmp, 2);
+    }
     Closure *x = stg_pop(stg);
     stg_pop(stg);  /* discard y */
     
@@ -351,6 +371,10 @@ static Closure *entry_K1(STG *stg, Closure *self) {
         return self;
     }
     
+    stg->steps++;
+    if (stg->max_steps && stg->steps >= stg->max_steps) {
+        longjmp(stg->exit_jmp, 2);
+    }
     stg_pop(stg);  /* discard y */
     Closure *x = self->payload.k1.x;
     
@@ -1023,6 +1047,8 @@ static void stg_reset(void) {
     g_stg->sp = g_stg->stack_base;
     g_stg->update_sp = 0;
     g_stg->current_node = NULL;
+    g_stg->steps = 0;
+    g_stg->max_steps = 0;
     
     /* Re-establish primitives at start of space 0 */
     g_stg->prim_S = g_stg->space[0];
@@ -1041,10 +1067,18 @@ SKITerm *stg_reduce(SKIPool *pool, SKITerm *term, i64 *steps) {
     stg_init();
     stg_reset();
     
+    /* If *steps is nonzero, use it as a bound */
+    g_stg->max_steps = *steps;
+    
     int status = setjmp(g_stg->exit_jmp);
-    if (status != 0) {
+    if (status == 1) {
         /* Error occurred */
         *steps = -1;
+        return ski_i(pool);
+    }
+    if (status == 2) {
+        /* Step limit exceeded - return current steps */
+        *steps = g_stg->steps;
         return ski_i(pool);
     }
     
@@ -1057,6 +1091,6 @@ SKITerm *stg_reduce(SKIPool *pool, SKITerm *term, i64 *steps) {
     /* Convert back */
     SKITerm *result_term = stg_to_term(pool, result);
     
-    *steps = 0;  /* TODO: count steps */
+    *steps = g_stg->steps;
     return result_term;
 }

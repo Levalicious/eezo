@@ -230,7 +230,7 @@ int main(int argc, char **argv) {
     }
     
     /* Evaluate */
-    i64 steps;
+    i64 steps = 0;  /* 0 = no step limit */
     SKITerm *result;
     
     if (use_native) {
