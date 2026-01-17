@@ -457,109 +457,120 @@ static void work_stack_push(WorkStack *ws, WorkItem item) {
     ws->items[ws->sp++] = item;
 }
 
-static WorkItem work_stack_pop(WorkStack *ws) {
-    return ws->items[--ws->sp];
-}
-
 static Closure *stg_normalize(STG *stg, Closure *c) {
     WorkStack ws;
     work_stack_init(&ws);
     
     Closure *result = NULL;
     
+    /* Computed goto jump table - gcc/clang extension */
+    static const void *dispatch[] = {
+        &&do_normalize,
+        &&do_s1_done,
+        &&do_s2_x_done,
+        &&do_s2_y_done,
+        &&do_k1_done,
+    };
+    
+    #define DISPATCH() do { \
+        if (ws.sp == 0) goto done; \
+        item = ws.items[--ws.sp]; \
+        goto *dispatch[item.type]; \
+    } while (0)
+    
+    WorkItem item;
     work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, c, NULL});
+    DISPATCH();
+
+do_normalize: {
+    Closure *cur = stg_enter(stg, item.closure);
     
-    while (ws.sp > 0) {
-        WorkItem item = work_stack_pop(&ws);
-        
-        switch (item.type) {
-        case WORK_NORMALIZE: {
-            Closure *cur = stg_enter(stg, item.closure);
-            
-            if (cur->entry == entry_S || cur->entry == entry_K || cur->entry == entry_I) {
-                result = cur;
-            }
-            else if (cur->entry == entry_S1) {
-                work_stack_push(&ws, (WorkItem){WORK_S1_DONE, cur, NULL});
-                work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.s1.x, NULL});
-            }
-            else if (cur->entry == entry_S2) {
-                work_stack_push(&ws, (WorkItem){WORK_S2_Y_DONE, cur, NULL});
-                work_stack_push(&ws, (WorkItem){WORK_S2_X_DONE, cur, NULL});
-                work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.s2.x, NULL});
-            }
-            else if (cur->entry == entry_K1) {
-                work_stack_push(&ws, (WorkItem){WORK_K1_DONE, cur, NULL});
-                work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.k1.x, NULL});
-            }
-            else if (cur->entry == entry_AP) {
-                stg_push(stg, cur->payload.ap.arg);
-                work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.ap.f, NULL});
-            }
-            else if (cur->entry == entry_IND) {
-                work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.ind.target, NULL});
-            }
-            else {
-                result = cur;
-            }
-            break;
-        }
-        
-        case WORK_S1_DONE: {
-            Closure *cur = item.closure;
-            Closure *x = result;
-            if (x != cur->payload.s1.x) {
-                Closure *new_c = stg_alloc(stg, 2);
-                new_c->entry = entry_S1;
-                new_c->payload.s1.x = x;
-                result = new_c;
-            } else {
-                result = cur;
-            }
-            break;
-        }
-        
-        case WORK_S2_X_DONE: {
-            /* x is done (in result), save it and push work to normalize y */
-            Closure *cur = item.closure;
-            /* Modify the Y_DONE item that's now at top of stack to carry saved_x */
-            ws.items[ws.sp - 1].saved_x = result;
-            work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.s2.y, NULL});
-            break;
-        }
-        
-        case WORK_S2_Y_DONE: {
-            Closure *cur = item.closure;
-            Closure *x = item.saved_x;
-            Closure *y = result;
-            if (x != cur->payload.s2.x || y != cur->payload.s2.y) {
-                Closure *new_c = stg_alloc(stg, 3);
-                new_c->entry = entry_S2;
-                new_c->payload.s2.x = x;
-                new_c->payload.s2.y = y;
-                result = new_c;
-            } else {
-                result = cur;
-            }
-            break;
-        }
-        
-        case WORK_K1_DONE: {
-            Closure *cur = item.closure;
-            Closure *x = result;
-            if (x != cur->payload.k1.x) {
-                Closure *new_c = stg_alloc(stg, 2);
-                new_c->entry = entry_K1;
-                new_c->payload.k1.x = x;
-                result = new_c;
-            } else {
-                result = cur;
-            }
-            break;
-        }
-        }
+    if (cur->entry == entry_S || cur->entry == entry_K || cur->entry == entry_I) {
+        result = cur;
+        DISPATCH();
     }
-    
+    if (cur->entry == entry_S1) {
+        work_stack_push(&ws, (WorkItem){WORK_S1_DONE, cur, NULL});
+        work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.s1.x, NULL});
+        DISPATCH();
+    }
+    if (cur->entry == entry_S2) {
+        work_stack_push(&ws, (WorkItem){WORK_S2_Y_DONE, cur, NULL});
+        work_stack_push(&ws, (WorkItem){WORK_S2_X_DONE, cur, NULL});
+        work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.s2.x, NULL});
+        DISPATCH();
+    }
+    if (cur->entry == entry_K1) {
+        work_stack_push(&ws, (WorkItem){WORK_K1_DONE, cur, NULL});
+        work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.k1.x, NULL});
+        DISPATCH();
+    }
+    if (cur->entry == entry_AP) {
+        stg_push(stg, cur->payload.ap.arg);
+        work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.ap.f, NULL});
+        DISPATCH();
+    }
+    if (cur->entry == entry_IND) {
+        work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.ind.target, NULL});
+        DISPATCH();
+    }
+    result = cur;
+    DISPATCH();
+}
+
+do_s1_done: {
+    Closure *cur = item.closure;
+    Closure *x = result;
+    if (x != cur->payload.s1.x) {
+        Closure *new_c = stg_alloc(stg, 2);
+        new_c->entry = entry_S1;
+        new_c->payload.s1.x = x;
+        result = new_c;
+    } else {
+        result = cur;
+    }
+    DISPATCH();
+}
+
+do_s2_x_done: {
+    Closure *cur = item.closure;
+    ws.items[ws.sp - 1].saved_x = result;
+    work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.s2.y, NULL});
+    DISPATCH();
+}
+
+do_s2_y_done: {
+    Closure *cur = item.closure;
+    Closure *x = item.saved_x;
+    Closure *y = result;
+    if (x != cur->payload.s2.x || y != cur->payload.s2.y) {
+        Closure *new_c = stg_alloc(stg, 3);
+        new_c->entry = entry_S2;
+        new_c->payload.s2.x = x;
+        new_c->payload.s2.y = y;
+        result = new_c;
+    } else {
+        result = cur;
+    }
+    DISPATCH();
+}
+
+do_k1_done: {
+    Closure *cur = item.closure;
+    Closure *x = result;
+    if (x != cur->payload.k1.x) {
+        Closure *new_c = stg_alloc(stg, 2);
+        new_c->entry = entry_K1;
+        new_c->payload.k1.x = x;
+        result = new_c;
+    } else {
+        result = cur;
+    }
+    DISPATCH();
+}
+
+done:
+    #undef DISPATCH
     work_stack_free(&ws);
     return result;
 }
