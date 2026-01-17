@@ -408,122 +408,419 @@ static Closure *stg_enter(STG *stg, Closure *c) {
 /*
  * Reduce to full HNF (not just WHNF)
  * After WHNF, recursively reduce arguments
+ * 
+ * ITERATIVE VERSION using explicit dynamically-growable work stack
+ * to avoid C stack overflow on deeply nested terms.
  */
+
+typedef enum {
+    WORK_NORMALIZE,     /* normalize closure, result goes to 'result' */
+    WORK_S1_DONE,       /* S1 child done, rebuild if changed */
+    WORK_S2_X_DONE,     /* S2 first child done, continue to y */
+    WORK_S2_Y_DONE,     /* S2 both children done, rebuild if changed */
+    WORK_K1_DONE,       /* K1 child done, rebuild if changed */
+} WorkType;
+
+typedef struct {
+    WorkType type;
+    Closure *closure;      /* closure being processed */
+    Closure *saved_x;      /* for S2: save normalized x while processing y */
+} WorkItem;
+
+typedef struct {
+    WorkItem *items;
+    size_t sp;       /* stack pointer (next free slot) */
+    size_t cap;      /* capacity */
+} WorkStack;
+
+static void work_stack_init(WorkStack *ws) {
+    ws->cap = 4096;
+    ws->items = malloc(ws->cap * sizeof(WorkItem));
+    ws->sp = 0;
+}
+
+static void work_stack_free(WorkStack *ws) {
+    free(ws->items);
+    ws->items = NULL;
+    ws->sp = ws->cap = 0;
+}
+
+static void work_stack_push(WorkStack *ws, WorkItem item) {
+    if (ws->sp >= ws->cap) {
+        ws->cap *= 2;
+        ws->items = realloc(ws->items, ws->cap * sizeof(WorkItem));
+        if (!ws->items) {
+            fprintf(stderr, "STG: work stack realloc failed\n");
+            exit(1);
+        }
+    }
+    ws->items[ws->sp++] = item;
+}
+
+static WorkItem work_stack_pop(WorkStack *ws) {
+    return ws->items[--ws->sp];
+}
+
 static Closure *stg_normalize(STG *stg, Closure *c) {
-    c = stg_enter(stg, c);
+    WorkStack ws;
+    work_stack_init(&ws);
     
-    if (c->entry == entry_S || c->entry == entry_K || c->entry == entry_I) {
-        /* Primitives with no payload to normalize */
-        return c;
-    }
+    Closure *result = NULL;
     
-    if (c->entry == entry_S1) {
-        Closure *x = stg_normalize(stg, c->payload.s1.x);
-        if (x != c->payload.s1.x) {
-            Closure *new_c = stg_alloc(stg, 2);
-            new_c->entry = entry_S1;
-            new_c->payload.s1.x = x;
-            return new_c;
+    work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, c, NULL});
+    
+    while (ws.sp > 0) {
+        WorkItem item = work_stack_pop(&ws);
+        
+        switch (item.type) {
+        case WORK_NORMALIZE: {
+            Closure *cur = stg_enter(stg, item.closure);
+            
+            if (cur->entry == entry_S || cur->entry == entry_K || cur->entry == entry_I) {
+                result = cur;
+            }
+            else if (cur->entry == entry_S1) {
+                work_stack_push(&ws, (WorkItem){WORK_S1_DONE, cur, NULL});
+                work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.s1.x, NULL});
+            }
+            else if (cur->entry == entry_S2) {
+                work_stack_push(&ws, (WorkItem){WORK_S2_Y_DONE, cur, NULL});
+                work_stack_push(&ws, (WorkItem){WORK_S2_X_DONE, cur, NULL});
+                work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.s2.x, NULL});
+            }
+            else if (cur->entry == entry_K1) {
+                work_stack_push(&ws, (WorkItem){WORK_K1_DONE, cur, NULL});
+                work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.k1.x, NULL});
+            }
+            else if (cur->entry == entry_AP) {
+                stg_push(stg, cur->payload.ap.arg);
+                work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.ap.f, NULL});
+            }
+            else if (cur->entry == entry_IND) {
+                work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.ind.target, NULL});
+            }
+            else {
+                result = cur;
+            }
+            break;
         }
-        return c;
-    }
-    
-    if (c->entry == entry_S2) {
-        Closure *x = stg_normalize(stg, c->payload.s2.x);
-        Closure *y = stg_normalize(stg, c->payload.s2.y);
-        if (x != c->payload.s2.x || y != c->payload.s2.y) {
-            Closure *new_c = stg_alloc(stg, 3);
-            new_c->entry = entry_S2;
-            new_c->payload.s2.x = x;
-            new_c->payload.s2.y = y;
-            return new_c;
+        
+        case WORK_S1_DONE: {
+            Closure *cur = item.closure;
+            Closure *x = result;
+            if (x != cur->payload.s1.x) {
+                Closure *new_c = stg_alloc(stg, 2);
+                new_c->entry = entry_S1;
+                new_c->payload.s1.x = x;
+                result = new_c;
+            } else {
+                result = cur;
+            }
+            break;
         }
-        return c;
-    }
-    
-    if (c->entry == entry_K1) {
-        Closure *x = stg_normalize(stg, c->payload.k1.x);
-        if (x != c->payload.k1.x) {
-            Closure *new_c = stg_alloc(stg, 2);
-            new_c->entry = entry_K1;
-            new_c->payload.k1.x = x;
-            return new_c;
+        
+        case WORK_S2_X_DONE: {
+            /* x is done (in result), save it and push work to normalize y */
+            Closure *cur = item.closure;
+            /* Modify the Y_DONE item that's now at top of stack to carry saved_x */
+            ws.items[ws.sp - 1].saved_x = result;
+            work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.s2.y, NULL});
+            break;
         }
-        return c;
+        
+        case WORK_S2_Y_DONE: {
+            Closure *cur = item.closure;
+            Closure *x = item.saved_x;
+            Closure *y = result;
+            if (x != cur->payload.s2.x || y != cur->payload.s2.y) {
+                Closure *new_c = stg_alloc(stg, 3);
+                new_c->entry = entry_S2;
+                new_c->payload.s2.x = x;
+                new_c->payload.s2.y = y;
+                result = new_c;
+            } else {
+                result = cur;
+            }
+            break;
+        }
+        
+        case WORK_K1_DONE: {
+            Closure *cur = item.closure;
+            Closure *x = result;
+            if (x != cur->payload.k1.x) {
+                Closure *new_c = stg_alloc(stg, 2);
+                new_c->entry = entry_K1;
+                new_c->payload.k1.x = x;
+                result = new_c;
+            } else {
+                result = cur;
+            }
+            break;
+        }
+        }
     }
     
-    if (c->entry == entry_AP) {
-        /* Shouldn't have AP in normal form after stg_enter - evaluate it */
-        stg_push(stg, c->payload.ap.arg);
-        return stg_normalize(stg, stg_enter(stg, c->payload.ap.f));
-    }
-    
-    if (c->entry == entry_IND) {
-        return stg_normalize(stg, c->payload.ind.target);
-    }
-    
-    return c;
+    work_stack_free(&ws);
+    return result;
 }
 
 /*
  * Convert SKITerm to STG closure
+ * ITERATIVE VERSION using explicit dynamically-growable stack
  */
+
+typedef enum {
+    CONV_VISIT,        /* visit this term */
+    CONV_APP_RIGHT,    /* left child done, do right */
+    CONV_APP_BUILD,    /* both children done, build AP */
+} ConvType;
+
+typedef struct {
+    ConvType type;
+    SKITerm *term;
+    Closure *left_result;
+} ConvItem;
+
+typedef struct {
+    ConvItem *items;
+    size_t sp;
+    size_t cap;
+} ConvStack;
+
+static void conv_stack_init(ConvStack *cs) {
+    cs->cap = 4096;
+    cs->items = malloc(cs->cap * sizeof(ConvItem));
+    cs->sp = 0;
+}
+
+static void conv_stack_free(ConvStack *cs) {
+    free(cs->items);
+    cs->items = NULL;
+    cs->sp = cs->cap = 0;
+}
+
+static void conv_stack_push(ConvStack *cs, ConvItem item) {
+    if (cs->sp >= cs->cap) {
+        cs->cap *= 2;
+        cs->items = realloc(cs->items, cs->cap * sizeof(ConvItem));
+        if (!cs->items) {
+            fprintf(stderr, "STG: conv stack realloc failed\n");
+            exit(1);
+        }
+    }
+    cs->items[cs->sp++] = item;
+}
+
+static ConvItem conv_stack_pop(ConvStack *cs) {
+    return cs->items[--cs->sp];
+}
+
 static Closure *term_to_stg(STG *stg, SKITerm *t) {
-    switch (t->tag) {
-    case TERM_S:
-        return stg->prim_S;
-    case TERM_K:
-        return stg->prim_K;
-    case TERM_I:
-        return stg->prim_I;
-    case TERM_APP: {
-        Closure *f = term_to_stg(stg, t->app.left);
-        Closure *arg = term_to_stg(stg, t->app.right);
-        Closure *ap = stg_alloc(stg, 3);
-        ap->entry = entry_AP;
-        ap->payload.ap.f = f;
-        ap->payload.ap.arg = arg;
-        return ap;
+    ConvStack cs;
+    conv_stack_init(&cs);
+    
+    Closure *result = NULL;
+    
+    conv_stack_push(&cs, (ConvItem){CONV_VISIT, t, NULL});
+    
+    while (cs.sp > 0) {
+        ConvItem item = conv_stack_pop(&cs);
+        
+        switch (item.type) {
+        case CONV_VISIT:
+            switch (item.term->tag) {
+            case TERM_S:
+                result = stg->prim_S;
+                break;
+            case TERM_K:
+                result = stg->prim_K;
+                break;
+            case TERM_I:
+                result = stg->prim_I;
+                break;
+            case TERM_APP:
+                conv_stack_push(&cs, (ConvItem){CONV_APP_BUILD, item.term, NULL});
+                conv_stack_push(&cs, (ConvItem){CONV_APP_RIGHT, item.term, NULL});
+                conv_stack_push(&cs, (ConvItem){CONV_VISIT, item.term->app.left, NULL});
+                break;
+            }
+            break;
+            
+        case CONV_APP_RIGHT:
+            /* left is done (in result), save it and do right */
+            cs.items[cs.sp - 1].left_result = result;
+            conv_stack_push(&cs, (ConvItem){CONV_VISIT, item.term->app.right, NULL});
+            break;
+            
+        case CONV_APP_BUILD: {
+            Closure *f = item.left_result;
+            Closure *arg = result;
+            Closure *ap = stg_alloc(stg, 3);
+            ap->entry = entry_AP;
+            ap->payload.ap.f = f;
+            ap->payload.ap.arg = arg;
+            result = ap;
+            break;
+        }
+        }
     }
-    }
-    return NULL;
+    
+    conv_stack_free(&cs);
+    return result;
 }
 
 /*
  * Convert STG closure back to SKITerm
+ * ITERATIVE VERSION using explicit dynamically-growable stack
  */
+
+typedef enum {
+    BACK_VISIT,
+    BACK_S1_DONE,
+    BACK_S2_X_DONE,
+    BACK_S2_BUILD,
+    BACK_K1_DONE,
+    BACK_AP_LEFT_DONE,
+    BACK_AP_BUILD,
+} BackType;
+
+typedef struct {
+    BackType type;
+    Closure *closure;
+    SKITerm *left_result;
+} BackItem;
+
+typedef struct {
+    BackItem *items;
+    size_t sp;
+    size_t cap;
+} BackStack;
+
+static void back_stack_init(BackStack *bs) {
+    bs->cap = 4096;
+    bs->items = malloc(bs->cap * sizeof(BackItem));
+    bs->sp = 0;
+}
+
+static void back_stack_free(BackStack *bs) {
+    free(bs->items);
+    bs->items = NULL;
+    bs->sp = bs->cap = 0;
+}
+
+static void back_stack_push(BackStack *bs, BackItem item) {
+    if (bs->sp >= bs->cap) {
+        bs->cap *= 2;
+        bs->items = realloc(bs->items, bs->cap * sizeof(BackItem));
+        if (!bs->items) {
+            fprintf(stderr, "STG: back stack realloc failed\n");
+            exit(1);
+        }
+    }
+    bs->items[bs->sp++] = item;
+}
+
+static BackItem back_stack_pop(BackStack *bs) {
+    return bs->items[--bs->sp];
+}
+
 static SKITerm *stg_to_term(SKIPool *pool, Closure *c) {
-    if (c->entry == entry_IND) {
-        return stg_to_term(pool, c->payload.ind.target);
+    BackStack bs;
+    back_stack_init(&bs);
+    
+    SKITerm *result = NULL;
+    
+    back_stack_push(&bs, (BackItem){BACK_VISIT, c, NULL});
+    
+    while (bs.sp > 0) {
+        BackItem item = back_stack_pop(&bs);
+        
+        switch (item.type) {
+        case BACK_VISIT: {
+            Closure *cur = item.closure;
+            
+            /* Follow indirections */
+            while (cur->entry == entry_IND) {
+                cur = cur->payload.ind.target;
+            }
+            
+            if (cur->entry == entry_S) {
+                result = ski_s(pool);
+            }
+            else if (cur->entry == entry_K) {
+                result = ski_k(pool);
+            }
+            else if (cur->entry == entry_I) {
+                result = ski_i(pool);
+            }
+            else if (cur->entry == entry_S1) {
+                back_stack_push(&bs, (BackItem){BACK_S1_DONE, cur, NULL});
+                back_stack_push(&bs, (BackItem){BACK_VISIT, cur->payload.s1.x, NULL});
+            }
+            else if (cur->entry == entry_S2) {
+                back_stack_push(&bs, (BackItem){BACK_S2_BUILD, cur, NULL});
+                back_stack_push(&bs, (BackItem){BACK_S2_X_DONE, cur, NULL});
+                back_stack_push(&bs, (BackItem){BACK_VISIT, cur->payload.s2.x, NULL});
+            }
+            else if (cur->entry == entry_K1) {
+                back_stack_push(&bs, (BackItem){BACK_K1_DONE, cur, NULL});
+                back_stack_push(&bs, (BackItem){BACK_VISIT, cur->payload.k1.x, NULL});
+            }
+            else if (cur->entry == entry_AP) {
+                back_stack_push(&bs, (BackItem){BACK_AP_BUILD, cur, NULL});
+                back_stack_push(&bs, (BackItem){BACK_AP_LEFT_DONE, cur, NULL});
+                back_stack_push(&bs, (BackItem){BACK_VISIT, cur->payload.ap.f, NULL});
+            }
+            else {
+                result = ski_i(pool);  /* fallback */
+            }
+            break;
+        }
+        
+        case BACK_S1_DONE: {
+            SKITerm *x = result;
+            result = ski_app(pool, ski_s(pool), x);
+            break;
+        }
+        
+        case BACK_S2_X_DONE: {
+            /* x done, save and do y */
+            bs.items[bs.sp - 1].left_result = result;
+            back_stack_push(&bs, (BackItem){BACK_VISIT, item.closure->payload.s2.y, NULL});
+            break;
+        }
+        
+        case BACK_S2_BUILD: {
+            SKITerm *x = item.left_result;
+            SKITerm *y = result;
+            result = ski_app(pool, ski_app(pool, ski_s(pool), x), y);
+            break;
+        }
+        
+        case BACK_K1_DONE: {
+            SKITerm *x = result;
+            result = ski_app(pool, ski_k(pool), x);
+            break;
+        }
+        
+        case BACK_AP_LEFT_DONE: {
+            /* f done, save and do arg */
+            bs.items[bs.sp - 1].left_result = result;
+            back_stack_push(&bs, (BackItem){BACK_VISIT, item.closure->payload.ap.arg, NULL});
+            break;
+        }
+        
+        case BACK_AP_BUILD: {
+            SKITerm *f = item.left_result;
+            SKITerm *arg = result;
+            result = ski_app(pool, f, arg);
+            break;
+        }
+        }
     }
-    if (c->entry == entry_S) {
-        return ski_s(pool);
-    }
-    if (c->entry == entry_K) {
-        return ski_k(pool);
-    }
-    if (c->entry == entry_I) {
-        return ski_i(pool);
-    }
-    if (c->entry == entry_S1) {
-        SKITerm *x = stg_to_term(pool, c->payload.s1.x);
-        return ski_app(pool, ski_s(pool), x);
-    }
-    if (c->entry == entry_S2) {
-        SKITerm *x = stg_to_term(pool, c->payload.s2.x);
-        SKITerm *y = stg_to_term(pool, c->payload.s2.y);
-        return ski_app(pool, ski_app(pool, ski_s(pool), x), y);
-    }
-    if (c->entry == entry_K1) {
-        SKITerm *x = stg_to_term(pool, c->payload.k1.x);
-        return ski_app(pool, ski_k(pool), x);
-    }
-    if (c->entry == entry_AP) {
-        SKITerm *f = stg_to_term(pool, c->payload.ap.f);
-        SKITerm *arg = stg_to_term(pool, c->payload.ap.arg);
-        return ski_app(pool, f, arg);
-    }
-    return ski_i(pool);  /* fallback */
+    
+    back_stack_free(&bs);
+    return result;
 }
 
 /* ========================================================================
