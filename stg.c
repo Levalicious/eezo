@@ -84,14 +84,24 @@ typedef struct STG {
     struct WorkStack *ws_root;   /* live normalizer work stack, or NULL */
     struct ConvStack *cs_root;   /* live term_to_stg conversion stack, or NULL */
     
-    /* Update frames: when we enter a thunk, push its address */
-    /* so we can overwrite it when we get the result */
+    /* Update frames: pushed when an AP thunk is entered; popped when a
+     * value is returned to it, at which point the thunk is overwritten
+     * with an IND to the value (sharing). saved_sp is the arg-stack
+     * pointer at push time and acts as a BARRIER: args below it belong
+     * to enclosing evaluations and are invisible until the frame pops. */
     struct {
         Closure *thunk;
         Closure **saved_sp;
     } *update_stack;
     int update_sp;
     int update_size;
+    
+    /* Trampoline: an entry code that wants to tail-call sets `next` and
+     * returns NULL; stg_enter loops instead of growing the C stack. */
+    Closure *next;
+    
+    /* Normalization mode: 0 = full normal form, 1 = weak head normal form */
+    int whnf;
     
     /* For returning to C */
     jmp_buf exit_jmp;
@@ -210,20 +220,55 @@ static void stg_push(STG *stg, Closure *c) {
 }
 
 /*
- * Pop from argument stack
+ * Arg-stack barrier: args below the topmost update frame belong to an
+ * enclosing evaluation and must not be consumed by the current one.
+ */
+static Closure **stg_barrier(STG *stg) {
+    return stg->update_sp > 0 ? stg->update_stack[stg->update_sp - 1].saved_sp
+                              : stg->stack_base;
+}
+
+/*
+ * Pop from argument stack (never past the barrier)
  */
 static Closure *stg_pop(STG *stg) {
-    if (stg->sp >= stg->stack_base) {
-        return NULL;  /* stack empty */
+    if (stg->sp >= stg_barrier(stg)) {
+        return NULL;  /* no args visible */
     }
     return *stg->sp++;
 }
 
 /*
- * Number of args on stack
+ * Number of args visible above the barrier
  */
 static int stg_stack_size(STG *stg) {
-    return (int)(stg->stack_base - stg->sp);
+    return (int)(stg_barrier(stg) - stg->sp);
+}
+
+/*
+ * Push an update frame for thunk `t` (current sp becomes its barrier)
+ */
+static void stg_push_update(STG *stg, Closure *t) {
+    if (stg->update_sp >= stg->update_size) {
+        stg->update_size *= 2;
+        stg->update_stack = realloc(stg->update_stack,
+                                    stg->update_size * sizeof(stg->update_stack[0]));
+        if (!stg->update_stack) {
+            fprintf(stderr, "STG: update stack realloc failed\n");
+            exit(1);
+        }
+    }
+    stg->update_stack[stg->update_sp].thunk = t;
+    stg->update_stack[stg->update_sp].saved_sp = stg->sp;
+    stg->update_sp++;
+}
+
+/*
+ * Tail call: request that stg_enter continue with `c`
+ */
+static Closure *stg_tail(STG *stg, Closure *c) {
+    stg->next = c;
+    return NULL;
 }
 
 /* ========================================================================
@@ -290,7 +335,7 @@ static Closure *entry_S(STG *stg, Closure *self) {
     stg_push(stg, z);
     
     /* Tail-call into x */
-    return x->entry(stg, x);
+    return stg_tail(stg, x);
 }
 
 /*
@@ -335,7 +380,7 @@ static Closure *entry_S1(STG *stg, Closure *self) {
     stg_push(stg, yz);
     stg_push(stg, z);
     
-    return x->entry(stg, x);
+    return stg_tail(stg, x);
 }
 
 /*
@@ -367,7 +412,7 @@ static Closure *entry_S2(STG *stg, Closure *self) {
     stg_push(stg, yz);
     stg_push(stg, z);
     
-    return x->entry(stg, x);
+    return stg_tail(stg, x);
 }
 
 /*
@@ -399,7 +444,7 @@ static Closure *entry_K(STG *stg, Closure *self) {
     Closure *x = stg_pop(stg);
     stg_pop(stg);  /* discard y */
     
-    return x->entry(stg, x);
+    return stg_tail(stg, x);
 }
 
 /*
@@ -419,7 +464,7 @@ static Closure *entry_K1(STG *stg, Closure *self) {
     stg_pop(stg);  /* discard y */
     Closure *x = self->payload.k1.x;
     
-    return x->entry(stg, x);
+    return stg_tail(stg, x);
 }
 
 /*
@@ -435,19 +480,25 @@ static Closure *entry_I(STG *stg, Closure *self) {
     }
     
     Closure *x = stg_pop(stg);
-    return x->entry(stg, x);
+    return stg_tail(stg, x);
 }
 
 /*
  * Application thunk entry code
- * (f arg) → push arg, enter f
+ * (f arg) → push update frame for self, push arg, enter f
+ *
+ * The frame's barrier hides any args already on the stack, so f sees
+ * exactly `arg`; when f's evaluation returns a value with the barrier
+ * reached, stg_enter overwrites self with IND -> value and pops the
+ * frame, then applies the value to the args that became visible.
  */
 static Closure *entry_AP(STG *stg, Closure *self) {
     Closure *f = self->payload.ap.f;
     Closure *arg = self->payload.ap.arg;
     
+    stg_push_update(stg, self);
     stg_push(stg, arg);
-    return f->entry(stg, f);
+    return stg_tail(stg, f);
 }
 
 /*
@@ -456,7 +507,7 @@ static Closure *entry_AP(STG *stg, Closure *self) {
  */
 static Closure *entry_IND(STG *stg, Closure *self) {
     Closure *target = self->payload.ind.target;
-    return target->entry(stg, target);
+    return stg_tail(stg, target);
 }
 
 /*
@@ -464,15 +515,42 @@ static Closure *entry_IND(STG *stg, Closure *self) {
  * This is now just a single indirect call, not a switch!
  */
 static Closure *stg_enter(STG *stg, Closure *c) {
-    stg->current_node = c;  /* Mark as GC root */
-    Closure *result = c->entry(stg, c);
-    stg->current_node = result;  /* Update root after reduction */
-    return result;
+    for (;;) {
+        stg->current_node = c;  /* Mark as GC root */
+        Closure *v = c->entry(stg, c);
+        if (!v) {
+            c = stg->next;      /* tail call requested */
+            continue;
+        }
+        
+        /* v is a value w.r.t. the args above the top update frame. An
+         * entry returns a value only when it has consumed every visible
+         * arg, so sp == barrier: pop the frames whose evaluation this
+         * value completes and update their thunks. */
+        while (stg->update_sp > 0 &&
+               stg->update_stack[stg->update_sp - 1].saved_sp == stg->sp) {
+            Closure *t = stg->update_stack[stg->update_sp - 1].thunk;
+            stg->update_sp--;
+            if (t != v) {
+                t->entry = entry_IND;
+                t->payload.ind.target = v;
+            }
+        }
+        
+        /* Popping frames may have exposed enclosing args: apply v to them */
+        if (stg_stack_size(stg) > 0) {
+            c = v;
+            continue;
+        }
+        
+        stg->current_node = v;  /* Update root after reduction */
+        return v;
+    }
 }
 
 /*
- * Reduce to full HNF (not just WHNF)
- * After WHNF, recursively reduce arguments
+ * Reduce to full NORMAL FORM (not just WHNF)
+ * After WHNF, recursively normalize the captured arguments of PAPs
  * 
  * ITERATIVE VERSION using explicit dynamically-growable work stack
  * to avoid C stack overflow on deeply nested terms.
@@ -1145,6 +1223,8 @@ static void stg_reset(void) {
     for (int i = 0; i < 4; i++) g_stg->extra_roots[i] = NULL;
     g_stg->ws_root = NULL;
     g_stg->cs_root = NULL;
+    g_stg->next = NULL;
+    g_stg->whnf = 0;
     g_stg->steps = 0;
     g_stg->max_steps = 0;
     
@@ -1161,12 +1241,13 @@ static void stg_reset(void) {
  * Public API
  */
 
-SKITerm *stg_reduce(SKIPool *pool, SKITerm *term, i64 *steps) {
+SKITerm *stg_reduce(SKIPool *pool, SKITerm *term, i64 *steps, int whnf) {
     stg_init();
     stg_reset();
     
     /* If *steps is nonzero, use it as a bound */
     g_stg->max_steps = *steps;
+    g_stg->whnf = whnf;
     
     int status = setjmp(g_stg->exit_jmp);
     if (status == 1) {
@@ -1183,8 +1264,9 @@ SKITerm *stg_reduce(SKIPool *pool, SKITerm *term, i64 *steps) {
     /* Convert to STG representation */
     Closure *c = term_to_stg(g_stg, term);
     
-    /* Reduce to HNF */
-    Closure *result = stg_normalize(g_stg, c);
+    /* Reduce: full normal form (args of PAPs normalized recursively),
+     * or weak head normal form only */
+    Closure *result = g_stg->whnf ? stg_enter(g_stg, c) : stg_normalize(g_stg, c);
     
     /* Convert back */
     SKITerm *result_term = stg_to_term(pool, result);

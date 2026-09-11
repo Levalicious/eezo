@@ -28,6 +28,9 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -f FORMAT     Format: bcl (default), jot, jomplement\n");
     fprintf(stderr, "  -s            Use simple interpreter (default: STG machine)\n");
     fprintf(stderr, "  -n            Use native JIT (x86_64)\n");
+    fprintf(stderr, "  -N MODE       Normalization: nf (default, full normal form) or whnf\n");
+    fprintf(stderr, "                (weak head normal form: head reduction only). Not\n");
+    fprintf(stderr, "                available with -n: the native backend is call-by-value.\n");
     fprintf(stderr, "  -v            Verbose output\n");
     fprintf(stderr, "  -h            Show this help\n");
     fprintf(stderr, "\nInput is ASCII '0'/'1' bits read from stdin.\n");
@@ -144,6 +147,7 @@ int main(int argc, char **argv) {
     int use_simple = 0;
     int use_native = 0;
     int verbose = 0;
+    int whnf = 0;
     
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
@@ -156,6 +160,19 @@ int main(int argc, char **argv) {
             use_simple = 1;
         } else if (strcmp(argv[i], "-n") == 0) {
             use_native = 1;
+        } else if (strcmp(argv[i], "-N") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "Missing argument for -N\n");
+                return 1;
+            }
+            if (strcmp(argv[i], "nf") == 0) {
+                whnf = 0;
+            } else if (strcmp(argv[i], "whnf") == 0) {
+                whnf = 1;
+            } else {
+                fprintf(stderr, "Unknown normalization mode: %s (nf|whnf)\n", argv[i]);
+                return 1;
+            }
         } else if (strcmp(argv[i], "-f") == 0) {
             if (++i >= argc) {
                 fprintf(stderr, "Missing argument for -f\n");
@@ -233,6 +250,12 @@ int main(int argc, char **argv) {
     i64 steps = 0;  /* 0 = no step limit */
     SKITerm *result;
     
+    if (use_native && whnf) {
+        fprintf(stderr, "-N whnf is not available with -n (native backend is call-by-value)\n");
+        pool_free(&pool);
+        return 1;
+    }
+    
     if (use_native) {
         if (verbose) fprintf(stderr, "Using native JIT...\n");
         
@@ -288,11 +311,11 @@ int main(int argc, char **argv) {
         
     } else if (use_simple) {
         if (verbose) fprintf(stderr, "Using simple interpreter...\n");
-        steps = ski_reduce(&pool, &term, 0);
+        steps = ski_reduce_mode(&pool, &term, 0, whnf != 0);
         result = term;
     } else {
         if (verbose) fprintf(stderr, "Using STG machine...\n");
-        result = stg_reduce(&pool, term, &steps);
+        result = stg_reduce(&pool, term, &steps, whnf);
         ski_unref(&pool, term);
     }
     
