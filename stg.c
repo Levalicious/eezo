@@ -35,6 +35,8 @@
 /* Forward declarations */
 struct Closure;
 struct STG;
+struct WorkStack;
+struct ConvStack;
 
 /*
  * Entry code function type - this is the "tagless" dispatch mechanism
@@ -74,6 +76,13 @@ typedef struct STG {
     
     /* Current node being evaluated - needed for GC roots */
     Closure *current_node;
+    
+    /* Extra GC roots: C-held closure pointers that must survive a GC
+     * triggered by stg_reserve(). Callers stash pointers here before
+     * reserving and reload them afterwards. */
+    Closure *extra_roots[4];
+    struct WorkStack *ws_root;   /* live normalizer work stack, or NULL */
+    struct ConvStack *cs_root;   /* live term_to_stg conversion stack, or NULL */
     
     /* Update frames: when we enter a thunk, push its address */
     /* so we can overwrite it when we get the result */
@@ -171,6 +180,25 @@ static Closure *stg_alloc(STG *stg, int words) {
 }
 
 /*
+ * Ensure `words` words can be allocated WITHOUT a GC.
+ * Call this BEFORE loading closure pointers into C locals (pops, self
+ * payload reads); everything still on the arg stack / in roots survives
+ * the collection this may trigger. Subsequent stg_alloc calls totalling
+ * `words` are then GC-free.
+ */
+static void stg_reserve(STG *stg, int words) {
+    Closure *new_hp = (Closure*)((char*)stg->hp + words * WORD);
+    if ((char*)new_hp >= (char*)stg->heap_end) {
+        stg_gc(stg);
+        new_hp = (Closure*)((char*)stg->hp + words * WORD);
+        if ((char*)new_hp >= (char*)stg->heap_end) {
+            fprintf(stderr, "STG: heap overflow after GC (need %d words)\n", words);
+            longjmp(stg->exit_jmp, 1);
+        }
+    }
+}
+
+/*
  * Push to argument stack
  */
 static void stg_push(STG *stg, Closure *c) {
@@ -223,12 +251,14 @@ static Closure *entry_S(STG *stg, Closure *self) {
         if (n == 0) {
             return stg->prim_S;
         } else if (n == 1) {
+            stg_reserve(stg, 2);
             Closure *x = stg_pop(stg);
             Closure *s1 = stg_alloc(stg, 2);
             s1->entry = entry_S1;
             s1->payload.s1.x = x;
             return s1;
         } else { /* n == 2 */
+            stg_reserve(stg, 3);
             Closure *x = stg_pop(stg);
             Closure *y = stg_pop(stg);
             Closure *s2 = stg_alloc(stg, 3);
@@ -244,6 +274,7 @@ static Closure *entry_S(STG *stg, Closure *self) {
     if (stg->max_steps && stg->steps >= stg->max_steps) {
         longjmp(stg->exit_jmp, 2);  /* step limit exceeded */
     }
+    stg_reserve(stg, 3);
     Closure *x = stg_pop(stg);
     Closure *y = stg_pop(stg);
     Closure *z = stg_pop(stg);
@@ -273,6 +304,9 @@ static Closure *entry_S1(STG *stg, Closure *self) {
         if (n == 0) {
             return self;
         } else { /* n == 1 */
+            stg->current_node = self;
+            stg_reserve(stg, 3);
+            self = stg->current_node;
             Closure *y = stg_pop(stg);
             Closure *s2 = stg_alloc(stg, 3);
             s2->entry = entry_S2;
@@ -286,6 +320,9 @@ static Closure *entry_S1(STG *stg, Closure *self) {
     if (stg->max_steps && stg->steps >= stg->max_steps) {
         longjmp(stg->exit_jmp, 2);
     }
+    stg->current_node = self;
+    stg_reserve(stg, 3);
+    self = stg->current_node;
     Closure *x = self->payload.s1.x;
     Closure *y = stg_pop(stg);
     Closure *z = stg_pop(stg);
@@ -315,6 +352,9 @@ static Closure *entry_S2(STG *stg, Closure *self) {
     if (stg->max_steps && stg->steps >= stg->max_steps) {
         longjmp(stg->exit_jmp, 2);
     }
+    stg->current_node = self;
+    stg_reserve(stg, 3);
+    self = stg->current_node;
     Closure *x = self->payload.s2.x;
     Closure *y = self->payload.s2.y;
     Closure *z = stg_pop(stg);
@@ -343,6 +383,7 @@ static Closure *entry_K(STG *stg, Closure *self) {
         if (n == 0) {
             return stg->prim_K;
         } else { /* n == 1 */
+            stg_reserve(stg, 2);
             Closure *x = stg_pop(stg);
             Closure *k1 = stg_alloc(stg, 2);
             k1->entry = entry_K1;
@@ -451,7 +492,7 @@ typedef struct {
     Closure *saved_x;      /* for S2: save normalized x while processing y */
 } WorkItem;
 
-typedef struct {
+typedef struct WorkStack {
     WorkItem *items;
     size_t sp;       /* stack pointer (next free slot) */
     size_t cap;      /* capacity */
@@ -484,6 +525,7 @@ static void work_stack_push(WorkStack *ws, WorkItem item) {
 static Closure *stg_normalize(STG *stg, Closure *c) {
     WorkStack ws;
     work_stack_init(&ws);
+    stg->ws_root = &ws;  /* pending items are GC roots */
     
     Closure *result = NULL;
     
@@ -545,6 +587,12 @@ do_normalize: {
 do_s1_done: {
     Closure *cur = item.closure;
     Closure *x = result;
+    stg->extra_roots[0] = cur;
+    stg->extra_roots[1] = x;
+    stg_reserve(stg, 2);
+    cur = stg->extra_roots[0];
+    x = stg->extra_roots[1];
+    stg->extra_roots[0] = stg->extra_roots[1] = NULL;
     if (x != cur->payload.s1.x) {
         Closure *new_c = stg_alloc(stg, 2);
         new_c->entry = entry_S1;
@@ -567,6 +615,14 @@ do_s2_y_done: {
     Closure *cur = item.closure;
     Closure *x = item.saved_x;
     Closure *y = result;
+    stg->extra_roots[0] = cur;
+    stg->extra_roots[1] = x;
+    stg->extra_roots[2] = y;
+    stg_reserve(stg, 3);
+    cur = stg->extra_roots[0];
+    x = stg->extra_roots[1];
+    y = stg->extra_roots[2];
+    stg->extra_roots[0] = stg->extra_roots[1] = stg->extra_roots[2] = NULL;
     if (x != cur->payload.s2.x || y != cur->payload.s2.y) {
         Closure *new_c = stg_alloc(stg, 3);
         new_c->entry = entry_S2;
@@ -582,6 +638,12 @@ do_s2_y_done: {
 do_k1_done: {
     Closure *cur = item.closure;
     Closure *x = result;
+    stg->extra_roots[0] = cur;
+    stg->extra_roots[1] = x;
+    stg_reserve(stg, 2);
+    cur = stg->extra_roots[0];
+    x = stg->extra_roots[1];
+    stg->extra_roots[0] = stg->extra_roots[1] = NULL;
     if (x != cur->payload.k1.x) {
         Closure *new_c = stg_alloc(stg, 2);
         new_c->entry = entry_K1;
@@ -595,6 +657,7 @@ do_k1_done: {
 
 done:
     #undef DISPATCH
+    stg->ws_root = NULL;
     work_stack_free(&ws);
     return result;
 }
@@ -616,7 +679,7 @@ typedef struct {
     Closure *left_result;
 } ConvItem;
 
-typedef struct {
+typedef struct ConvStack {
     ConvItem *items;
     size_t sp;
     size_t cap;
@@ -653,6 +716,7 @@ static ConvItem conv_stack_pop(ConvStack *cs) {
 static Closure *term_to_stg(STG *stg, SKITerm *t) {
     ConvStack cs;
     conv_stack_init(&cs);
+    stg->cs_root = &cs;  /* pending left_results are GC roots */
     
     Closure *result = NULL;
     
@@ -690,6 +754,12 @@ static Closure *term_to_stg(STG *stg, SKITerm *t) {
         case CONV_APP_BUILD: {
             Closure *f = item.left_result;
             Closure *arg = result;
+            stg->extra_roots[0] = f;
+            stg->extra_roots[1] = arg;
+            stg_reserve(stg, 3);
+            f = stg->extra_roots[0];
+            arg = stg->extra_roots[1];
+            stg->extra_roots[0] = stg->extra_roots[1] = NULL;
             Closure *ap = stg_alloc(stg, 3);
             ap->entry = entry_AP;
             ap->payload.ap.f = f;
@@ -700,6 +770,7 @@ static Closure *term_to_stg(STG *stg, SKITerm *t) {
         }
     }
     
+    stg->cs_root = NULL;
     conv_stack_free(&cs);
     return result;
 }
@@ -975,6 +1046,30 @@ static void stg_gc(STG *stg) {
         stg->update_stack[i].thunk = gc_copy(stg, stg->update_stack[i].thunk, &to_hp);
     }
     
+    /* Copy roots: C-held temporaries stashed around a stg_reserve() */
+    for (int i = 0; i < 4; i++) {
+        if (stg->extra_roots[i]) {
+            stg->extra_roots[i] = gc_copy(stg, stg->extra_roots[i], &to_hp);
+        }
+    }
+    
+    /* Copy roots: pending normalizer work items */
+    if (stg->ws_root) {
+        for (size_t i = 0; i < stg->ws_root->sp; i++) {
+            WorkItem *w = &stg->ws_root->items[i];
+            w->closure = gc_copy(stg, w->closure, &to_hp);
+            w->saved_x = gc_copy(stg, w->saved_x, &to_hp);
+        }
+    }
+    
+    /* Copy roots: pending term_to_stg conversion items */
+    if (stg->cs_root) {
+        for (size_t i = 0; i < stg->cs_root->sp; i++) {
+            ConvItem *ci = &stg->cs_root->items[i];
+            ci->left_result = gc_copy(stg, ci->left_result, &to_hp);
+        }
+    }
+    
     /* Cheney loop: scan copied closures and copy their children */
     while (scan < to_hp) {
         gc_scavenge(stg, scan, &to_hp);
@@ -1047,6 +1142,9 @@ static void stg_reset(void) {
     g_stg->sp = g_stg->stack_base;
     g_stg->update_sp = 0;
     g_stg->current_node = NULL;
+    for (int i = 0; i < 4; i++) g_stg->extra_roots[i] = NULL;
+    g_stg->ws_root = NULL;
+    g_stg->cs_root = NULL;
     g_stg->steps = 0;
     g_stg->max_steps = 0;
     
