@@ -22,6 +22,7 @@
  */
 
 #include "stg.h"
+#include "io.h"
 #include <libeezo/term.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -1273,4 +1274,113 @@ SKITerm *stg_reduce(SKIPool *pool, SKITerm *term, i64 *steps, int whnf) {
     
     *steps = g_stg->steps;
     return result_term;
+}
+
+/* ========================================================================
+ * Lazy-K / WHNF stream I/O driver (see io.h)
+ * ======================================================================== */
+
+static Closure *io_ap(STG *stg, Closure *f, Closure *x) {
+    Closure *c = stg_alloc(stg, 3);
+    c->entry = entry_AP;
+    c->payload.ap.f = f;
+    c->payload.ap.arg = x;
+    return c;
+}
+
+/* cons x y = S (S I (K x)) (K y): five cells; `si` is the shared (S I).
+ * *ky_out receives the (K y) cell so a cycle can be closed afterwards. */
+static Closure *io_cons(STG *stg, Closure *si, Closure *x, Closure *y, Closure **ky_out) {
+    Closure *kx = io_ap(stg, stg->prim_K, x);
+    Closure *a  = io_ap(stg, si, kx);
+    Closure *b  = io_ap(stg, stg->prim_S, a);
+    Closure *ky = io_ap(stg, stg->prim_K, y);
+    *ky_out = ky;
+    return io_ap(stg, b, ky);
+}
+
+int stg_run_io(SKIPool *pool, SKITerm *prog, const u8 *data, size_t len) {
+    (void)pool;
+    stg_init();
+    stg_reset();
+    STG *stg = g_stg;
+    
+    if (setjmp(stg->exit_jmp)) {
+        io_flush();
+        return 1;
+    }
+    
+    Closure *P = term_to_stg(stg, prog);
+    
+    /* The whole input stream is built inside one reserved block, so no
+     * collection can run while C locals point into it. */
+    size_t words = 2 + 12 + 256 * 3 + 3 + 15 * len + 15 + 3;
+    if (words + 64 > stg->heap_size / WORD) {
+        fprintf(stderr, "io: input too large for the STG heap (%zu bytes)\n", len);
+        return 1;
+    }
+    stg->extra_roots[0] = P;
+    stg_reserve(stg, (int)words);
+    P = stg->extra_roots[0];
+    stg->extra_roots[0] = NULL;
+    
+    /* Church numerals 0..256 as one shared chain:
+     *   num[0] = K I,  num[k] = succ num[k-1],  succ = S (S (K S) K) */
+    Closure *ki = stg_alloc(stg, 2);
+    ki->entry = entry_K1;
+    ki->payload.k1.x = stg->prim_I;
+    Closure *succ = io_ap(stg, stg->prim_S,
+                          io_ap(stg, io_ap(stg, stg->prim_S, io_ap(stg, stg->prim_K, stg->prim_S)),
+                                stg->prim_K));
+    Closure *num[257];
+    num[0] = ki;
+    for (int k = 1; k <= 256; k++) num[k] = io_ap(stg, succ, num[k - 1]);
+    
+    /* EOF: an infinite stream of 256, as a cycle */
+    Closure *si = io_ap(stg, stg->prim_S, stg->prim_I);
+    Closure *ky;
+    Closure *eof = io_cons(stg, si, num[256], NULL, &ky);
+    ky->payload.ap.arg = eof;
+    
+    /* The data, back to front */
+    Closure *s = eof;
+    for (size_t i = len; i > 0; i--) s = io_cons(stg, si, num[data[i - 1]], s, &ky);
+    
+    Closure *o = io_ap(stg, P, s);
+    
+    for (;;) {
+        Closure *v = stg_enter(stg, o);                        /* the output cell (WHNF) */
+        stg->extra_roots[0] = v;
+        stg_reserve(stg, 3);
+        v = stg->extra_roots[0];
+        Closure *h = stg_enter(stg, io_ap(stg, v, stg->prim_K));   /* head = v K */
+        stg->extra_roots[1] = h;
+        stg_reserve(stg, 6);
+        h = stg->extra_roots[1];
+        stg->extra_roots[1] = NULL;
+        Closure *t = stg_enter(stg, io_ap(stg, io_ap(stg, h, stg->prim_K), stg->prim_S));   /* h K S */
+        long n = 0;
+        while (t->entry == entry_K1) {                          /* K1[u]: one more, unfold u */
+            n++;
+            t = stg_enter(stg, t->payload.k1.x);
+        }
+        v = stg->extra_roots[0];
+        if (t->entry != entry_S) {
+            io_flush();
+            fprintf(stderr, "io: output element is not a numeral\n");
+            return 1;
+        }
+        if (n >= 256) {
+            io_flush();
+            return (int)(n - 256);
+        }
+        io_put_byte((int)n);
+        stg_reserve(stg, 5);
+        v = stg->extra_roots[0];
+        stg->extra_roots[0] = NULL;
+        Closure *kI = stg_alloc(stg, 2);                        /* K I */
+        kI->entry = entry_K1;
+        kI->payload.k1.x = stg->prim_I;
+        o = io_ap(stg, v, kI);                                  /* tail = v (K I) */
+    }
 }
