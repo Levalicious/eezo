@@ -1,0 +1,113 @@
+/*
+ * io.c - Lazy-K / WHNF stream I/O: stdin reading, the input stream as a
+ * term, and the driver for the simple interpreter. See io.h.
+ */
+#include "io.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+u8 *io_read_all_stdin(size_t *len) {
+    size_t cap = 65536, n = 0;
+    u8 *buf = malloc(cap);
+    if (!buf) { fprintf(stderr, "io: out of memory\n"); exit(1); }
+    for (;;) {
+        if (n == cap) {
+            cap *= 2;
+            buf = realloc(buf, cap);
+            if (!buf) { fprintf(stderr, "io: out of memory\n"); exit(1); }
+        }
+        ssize_t r = read(0, buf + n, cap - n);
+        if (r < 0) { perror("io: read"); exit(1); }
+        if (r == 0) break;
+        n += (size_t)r;
+    }
+    *len = n;
+    return buf;
+}
+
+void io_put_byte(int b) {
+    putchar(b);
+}
+
+void io_flush(void) {
+    fflush(stdout);
+}
+
+static SKITerm *app(SKIPool *p, SKITerm *l, SKITerm *r) {
+    SKITerm *t = ski_app(p, l, r);
+    if (!t) { fprintf(stderr, "io: term pool exhausted\n"); exit(1); }
+    return t;
+}
+
+/* cons x y = S (S I (K x)) (K y)  - the pair  f -> f x y.
+ * Takes ownership of one reference to x and to y. */
+static SKITerm *cons(SKIPool *p, SKITerm *x, SKITerm *y) {
+    SKITerm *six = app(p, app(p, ski_s(p), ski_i(p)), app(p, ski_k(p), x));
+    return app(p, app(p, ski_s(p), six), app(p, ski_k(p), y));
+}
+
+SKITerm *io_input_term(SKIPool *p, const u8 *data, size_t len) {
+    /* Church numerals 0..256 as one shared chain:
+     *   num[0] = K I,  num[k] = succ num[k-1],  succ = S (S (K S) K) */
+    SKITerm *succ = app(p, ski_s(p), app(p, app(p, ski_s(p), app(p, ski_k(p), ski_s(p))), ski_k(p)));
+    SKITerm *num[257];
+    num[0] = app(p, ski_k(p), ski_i(p));
+    for (int k = 1; k <= 256; k++)
+        num[k] = app(p, ski_ref(succ), ski_ref(num[k - 1]));
+    ski_unref(p, succ);
+    
+    /* EOF: an infinite stream of 256 - a cycle. The back edge holds a
+     * reference, so the cell lives until the pool is freed. */
+    SKITerm *eof = cons(p, ski_ref(num[256]), NULL);
+    eof->app.right->app.right = ski_ref(eof);
+    
+    /* The data, back to front, ending in the EOF stream */
+    SKITerm *s = eof;
+    for (size_t i = len; i > 0; i--)
+        s = cons(p, ski_ref(num[data[i - 1]]), s);
+    
+    for (int k = 0; k <= 256; k++) ski_unref(p, num[k]);
+    return s;
+}
+
+/* Reduce *t to weak head normal form in place */
+static SKITerm *whnf(SKIPool *p, SKITerm *t) {
+    if (ski_reduce_mode(p, &t, 0, true) < 0) {
+        io_flush();
+        fprintf(stderr, "io: reduction failed (term pool exhausted?)\n");
+        exit(1);
+    }
+    return t;
+}
+
+int io_run_simple(SKIPool *p, SKITerm *prog, const u8 *data, size_t len) {
+    SKITerm *o = app(p, prog, io_input_term(p, data, len));
+    for (;;) {
+        o = whnf(p, o);                                                   /* the output cell */
+        SKITerm *h = whnf(p, app(p, ski_ref(o), ski_k(p)));                /* head = o K */
+        SKITerm *t = whnf(p, app(p, app(p, h, ski_k(p)), ski_s(p)));       /* h K S */
+        long n = 0;
+        while (t->tag == TERM_APP && t->app.left->tag == TERM_K) {         /* K1[u]: one more */
+            n++;
+            SKITerm *u = ski_ref(t->app.right);
+            ski_unref(p, t);
+            t = whnf(p, u);
+        }
+        if (t->tag != TERM_S) {
+            io_flush();
+            fprintf(stderr, "io: output element is not a numeral\n");
+            return 1;
+        }
+        ski_unref(p, t);
+        if (n >= 256) {
+            io_flush();
+            return (int)(n - 256);
+        }
+        io_put_byte((int)n);
+        SKITerm *next = app(p, ski_ref(o), app(p, ski_k(p), ski_i(p)));    /* tail = o (K I) */
+        ski_unref(p, o);
+        o = next;
+    }
+}

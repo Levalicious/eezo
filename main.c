@@ -13,6 +13,7 @@
 #include <libeezo/jomplement.h>
 #include <libeezo/native.h>
 #include "stg.h"
+#include "io.h"
 
 /* Input format */
 typedef enum {
@@ -28,12 +29,14 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -f FORMAT     Format: bcl (default), jot, jomplement\n");
     fprintf(stderr, "  -s            Use simple interpreter (default: STG machine)\n");
     fprintf(stderr, "  -n            Use native JIT (x86_64)\n");
+    fprintf(stderr, "  -i            Stream I/O mode (Lazy-K): the program, given as a FILE argument,\n");
+    fprintf(stderr, "                maps the byte stream on stdin to the byte stream on stdout\n");
     fprintf(stderr, "  -H BYTES      (with -n) initial semispace size, default 16MiB; grows on demand\n");
     fprintf(stderr, "  -N MODE       Normalization: nf (default, full normal form) or whnf\n");
     fprintf(stderr, "                (weak head normal form: head reduction only)\n");
     fprintf(stderr, "  -v            Verbose output\n");
     fprintf(stderr, "  -h            Show this help\n");
-    fprintf(stderr, "\nInput is ASCII '0'/'1' bits read from stdin.\n");
+    fprintf(stderr, "\nThe program is ASCII '0'/'1' bits, read from FILE if given, else from stdin.\n");
 }
 
 /* Read ASCII bits from file into packed bytes */
@@ -145,6 +148,8 @@ static void output_result(SKITerm *term, Format fmt) {
 int main(int argc, char **argv) {
     Format fmt = FMT_BCL;
     int use_simple = 0;
+    int io_mode = 0;
+    const char *prog_path = NULL;
     int use_native = 0;
     int verbose = 0;
     int whnf = 0;
@@ -159,6 +164,8 @@ int main(int argc, char **argv) {
             verbose = 1;
         } else if (strcmp(argv[i], "-s") == 0) {
             use_simple = 1;
+        } else if (strcmp(argv[i], "-i") == 0) {
+            io_mode = 1;
         } else if (strcmp(argv[i], "-n") == 0) {
             use_native = 1;
         } else if (strcmp(argv[i], "-H") == 0) {
@@ -199,6 +206,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Unknown format: %s\n", argv[i]);
                 return 1;
             }
+        } else if (argv[i][0] != '-' && !prog_path) {
+            prog_path = argv[i];
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage(argv[0]);
@@ -208,7 +217,19 @@ int main(int argc, char **argv) {
     
     /* Read input */
     u64 nbits;
-    u8 *bits = read_bits(stdin, &nbits);
+    FILE *prog_in = stdin;
+    if (prog_path) {
+        prog_in = fopen(prog_path, "r");
+        if (!prog_in) {
+            perror(prog_path);
+            return 1;
+        }
+    } else if (io_mode) {
+        fprintf(stderr, "-i reads the program's input from stdin: give the program as a file argument\n");
+        return 1;
+    }
+    u8 *bits = read_bits(prog_in, &nbits);
+    if (prog_in != stdin) fclose(prog_in);
     if (!bits || nbits == 0) {
         fprintf(stderr, "No input\n");
         free(bits);
@@ -255,6 +276,41 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Input: ");
         ski_fprint(stderr, term);
         fprintf(stderr, "\n");
+    }
+    
+    /* Stream I/O mode: the program is a function from the input stream to
+     * the output stream; the driver forces it one WHNF at a time (io.h). */
+    if (io_mode) {
+        size_t data_len = 0;
+        u8 *data = NULL;
+        int rc;
+        /* the native child reads stdin itself; the C drivers take it here */
+        if (!use_native) data = io_read_all_stdin(&data_len);
+        if (use_native) {
+            u32 code_cap = 64 * 1024;
+            u8 *code_buf = malloc(code_cap);
+            NativeEmit e;
+            native_emit_init(&e, code_buf, code_cap, OUTPUT_BCL);
+            e.io_mode = 1;
+            native_emit_runtime(&e);
+            NativeJIT *jit = native_jit_prepare(&e, heap_size);
+            if (!jit || native_jit_load_term(jit, term) != 0) {
+                fprintf(stderr, "JIT preparation failed\n");
+                rc = 1;
+            } else {
+                /* the child reads the data from stdin itself */
+                rc = native_jit_run(jit);
+            }
+            native_jit_free(jit);
+            free(code_buf);
+        } else if (use_simple) {
+            rc = io_run_simple(&pool, term, data, data_len);
+        } else {
+            rc = stg_run_io(&pool, term, data, data_len);
+        }
+        free(data);
+        pool_free(&pool);
+        return rc;
     }
     
     /* Evaluate */
