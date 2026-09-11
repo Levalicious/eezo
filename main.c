@@ -28,9 +28,9 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -f FORMAT     Format: bcl (default), jot, jomplement\n");
     fprintf(stderr, "  -s            Use simple interpreter (default: STG machine)\n");
     fprintf(stderr, "  -n            Use native JIT (x86_64)\n");
+    fprintf(stderr, "  -H BYTES      (with -n) initial semispace size, default 16MiB; grows on demand\n");
     fprintf(stderr, "  -N MODE       Normalization: nf (default, full normal form) or whnf\n");
-    fprintf(stderr, "                (weak head normal form: head reduction only). Not\n");
-    fprintf(stderr, "                available with -n: the native backend is call-by-value.\n");
+    fprintf(stderr, "                (weak head normal form: head reduction only)\n");
     fprintf(stderr, "  -v            Verbose output\n");
     fprintf(stderr, "  -h            Show this help\n");
     fprintf(stderr, "\nInput is ASCII '0'/'1' bits read from stdin.\n");
@@ -148,6 +148,7 @@ int main(int argc, char **argv) {
     int use_native = 0;
     int verbose = 0;
     int whnf = 0;
+    u32 heap_size = 16 * 1024 * 1024;
     
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
@@ -160,6 +161,16 @@ int main(int argc, char **argv) {
             use_simple = 1;
         } else if (strcmp(argv[i], "-n") == 0) {
             use_native = 1;
+        } else if (strcmp(argv[i], "-H") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "Missing argument for -H\n");
+                return 1;
+            }
+            heap_size = (u32)strtoul(argv[i], NULL, 0);
+            if (heap_size < 4096) {
+                fprintf(stderr, "Heap size too small: %s\n", argv[i]);
+                return 1;
+            }
         } else if (strcmp(argv[i], "-N") == 0) {
             if (++i >= argc) {
                 fprintf(stderr, "Missing argument for -N\n");
@@ -250,12 +261,6 @@ int main(int argc, char **argv) {
     i64 steps = 0;  /* 0 = no step limit */
     SKITerm *result;
     
-    if (use_native && whnf) {
-        fprintf(stderr, "-N whnf is not available with -n (native backend is call-by-value)\n");
-        pool_free(&pool);
-        return 1;
-    }
-    
     if (use_native) {
         if (verbose) fprintf(stderr, "Using native JIT...\n");
         
@@ -274,10 +279,11 @@ int main(int argc, char **argv) {
         if (fmt == FMT_JOT) native_fmt = OUTPUT_JOT;
         else if (fmt == FMT_JOMPLEMENT) native_fmt = OUTPUT_JOMPLEMENT;
         native_emit_init(&e, code_buf, code_cap, native_fmt);
+        e.nf_mode = whnf ? 0 : 1;
         native_emit_runtime(&e);
         
         /* Prepare JIT */
-        NativeJIT *jit = native_jit_prepare(&e, 16 * 1024 * 1024);
+        NativeJIT *jit = native_jit_prepare(&e, heap_size);
         if (!jit) {
             fprintf(stderr, "JIT preparation failed\n");
             free(code_buf);

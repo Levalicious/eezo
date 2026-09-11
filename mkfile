@@ -8,6 +8,8 @@ OFILES=\
 
 HFILES=\
 	stg.h\
+	../libeezo/native.h\
+	../libeezo/term.h\
 
 LIBS=../libeezo
 
