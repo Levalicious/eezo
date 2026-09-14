@@ -153,7 +153,7 @@ int main(int argc, char **argv) {
     int use_native = 0;
     int verbose = 0;
     int whnf = 0;
-    u32 heap_size = 16 * 1024 * 1024;
+    u32 heap_size = NATIVE_DEFAULT_HEAP_SIZE;
     
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
