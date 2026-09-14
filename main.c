@@ -1,3 +1,4 @@
+#include <libeezo/res.h>
 /*
  * main.c - Eezo evaluator
  *
@@ -43,7 +44,7 @@ static void usage(const char *prog) {
 /* Read ASCII bits from file into packed bytes */
 static u8 *read_bits(FILE *f, u64 *out_nbits) {
     size_t cap = 8192;
-    u8 *bits = malloc(cap);
+    u8 *bits = rmalloc(cap);
     if (!bits) return NULL;
     
     u64 nbits = 0;
@@ -53,7 +54,7 @@ static u8 *read_bits(FILE *f, u64 *out_nbits) {
         if (c == '0' || c == '1') {
             if (nbits >= cap * 8) {
                 cap *= 2;
-                u8 *newbits = realloc(bits, cap);
+                u8 *newbits = rrealloc(bits, cap);
                 if (!newbits) {
                     free(bits);
                     return NULL;
@@ -78,9 +79,9 @@ static void output_result(SKITerm *term, Format fmt) {
     if (fmt == FMT_BCL || fmt == FMT_XBCL) {
         u64 size_bits = fmt == FMT_XBCL ? xbcl_size(term) : bcl_size(term);
         u32 buf_size = (size_bits + 7) / 8 + 8;
-        u8 *buf = malloc(buf_size);
+        u8 *buf = rmalloc(buf_size);
         if (!buf) {
-            fprintf(stderr, "Out of memory\n");
+            fprintf(stderr, "resource limit: out of memory\n");
             return;
         }
         memset(buf, 0, buf_size);
@@ -102,9 +103,9 @@ static void output_result(SKITerm *term, Format fmt) {
     } else if (fmt == FMT_JOT) {
         u64 size_bits = jot_size(term);
         u32 buf_size = (size_bits + 7) / 8 + 8;
-        u8 *buf = malloc(buf_size);
+        u8 *buf = rmalloc(buf_size);
         if (!buf) {
-            fprintf(stderr, "Out of memory\n");
+            fprintf(stderr, "resource limit: out of memory\n");
             return;
         }
         memset(buf, 0, buf_size);
@@ -124,9 +125,9 @@ static void output_result(SKITerm *term, Format fmt) {
     } else if (fmt == FMT_JOMPLEMENT) {
         u64 size_bits = jot_size(term);
         u32 buf_size = (size_bits + 7) / 8 + 8;
-        u8 *buf = malloc(buf_size);
+        u8 *buf = rmalloc(buf_size);
         if (!buf) {
-            fprintf(stderr, "Out of memory\n");
+            fprintf(stderr, "resource limit: out of memory\n");
             return;
         }
         memset(buf, 0, buf_size);
@@ -295,7 +296,7 @@ int main(int argc, char **argv) {
         if (!use_native) data = io_read_all_stdin(&data_len);
         if (use_native) {
             u32 code_cap = 64 * 1024;
-            u8 *code_buf = malloc(code_cap);
+            u8 *code_buf = rmalloc(code_cap);
             NativeEmit e;
             native_emit_init(&e, code_buf, code_cap, OUTPUT_BCL);
             e.io_mode = 1;
@@ -329,9 +330,9 @@ int main(int argc, char **argv) {
         
         /* Allocate code buffer */
         u32 code_cap = 64 * 1024;
-        u8 *code_buf = malloc(code_cap);
+        u8 *code_buf = rmalloc(code_cap);
         if (!code_buf) {
-            fprintf(stderr, "Out of memory\n");
+            fprintf(stderr, "resource limit: out of memory\n");
             pool_free(&pool);
             return 1;
         }
@@ -357,7 +358,7 @@ int main(int argc, char **argv) {
         
         /* Load term onto heap */
         if (native_jit_load_term(jit, term) != 0) {
-            fprintf(stderr, "Term too large for heap\n");
+            fprintf(stderr, "resource limit: term too large for heap\n");
             native_jit_free(jit);
             free(code_buf);
             pool_free(&pool);
