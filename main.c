@@ -20,6 +20,7 @@ typedef enum {
     FMT_BCL,
     FMT_JOT,
     FMT_JOMPLEMENT,
+    FMT_XBCL,
 } Format;
 
 static void usage(const char *prog) {
@@ -74,8 +75,8 @@ static u8 *read_bits(FILE *f, u64 *out_nbits) {
 
 /* Output result in specified format */
 static void output_result(SKITerm *term, Format fmt) {
-    if (fmt == FMT_BCL) {
-        u64 size_bits = bcl_size(term);
+    if (fmt == FMT_BCL || fmt == FMT_XBCL) {
+        u64 size_bits = fmt == FMT_XBCL ? xbcl_size(term) : bcl_size(term);
         u32 buf_size = (size_bits + 7) / 8 + 8;
         u8 *buf = malloc(buf_size);
         if (!buf) {
@@ -86,7 +87,7 @@ static void output_result(SKITerm *term, Format fmt) {
         
         BclBuffer bb;
         bcl_buffer_init(&bb, buf, buf_size * 8);
-        if (bcl_emit(term, &bb)) {
+        if (fmt == FMT_XBCL ? xbcl_emit(term, &bb) : bcl_emit(term, &bb)) {
             i32 bits = (i32)bcl_buffer_len(&bb);
             for (int b = 0; b < bits; b++) {
                 int byte_idx = b / 8;
@@ -202,6 +203,8 @@ int main(int argc, char **argv) {
                 fmt = FMT_JOT;
             } else if (strcmp(argv[i], "jomplement") == 0) {
                 fmt = FMT_JOMPLEMENT;
+            } else if (strcmp(argv[i], "xbcl") == 0) {
+                fmt = FMT_XBCL;
             } else {
                 fprintf(stderr, "Unknown format: %s\n", argv[i]);
                 return 1;
@@ -261,6 +264,10 @@ int main(int argc, char **argv) {
     case FMT_JOMPLEMENT:
         term = jomplement_parse(&pool, &s);
         if (verbose) fprintf(stderr, "Parsed Jomplement\n");
+        break;
+    case FMT_XBCL:
+        term = xbcl_parse(&pool, &s);
+        if (verbose) fprintf(stderr, "Parsed XBCL\n");
         break;
     }
     
@@ -334,6 +341,7 @@ int main(int argc, char **argv) {
         OutputFormat native_fmt = OUTPUT_BCL;
         if (fmt == FMT_JOT) native_fmt = OUTPUT_JOT;
         else if (fmt == FMT_JOMPLEMENT) native_fmt = OUTPUT_JOMPLEMENT;
+        else if (fmt == FMT_XBCL) native_fmt = OUTPUT_XBCL;
         native_emit_init(&e, code_buf, code_cap, native_fmt);
         e.nf_mode = whnf ? 0 : 1;
         native_emit_runtime(&e);

@@ -52,11 +52,14 @@ typedef struct Closure *(*EntryCode)(struct STG *stg, struct Closure *self);
 typedef struct Closure {
     EntryCode entry;      /* Entry code - NO TAG, just jump here */
     union {
-        struct { struct Closure *x; } s1;           /* S x */
-        struct { struct Closure *x, *y; } s2;       /* S x y */
+        struct { struct Closure *x; } s1;           /* S x; the layout of every one-argument PAP: S1 K1 B1 C1 T1 R1 (and PRIM1's x) */
+        struct { struct Closure *x, *y; } s2;       /* S x y; the layout of every two-argument PAP: S2 B2 C2 R2 */
         struct { struct Closure *x; } k1;           /* K x */
         struct { struct Closure *f, *arg; } ap;     /* f @ arg */
         struct { struct Closure *target; } ind;     /* -> target (also used as forwarding ptr) */
+        u64 word;                                   /* WORD: the machine word (not a pointer) */
+        struct { u64 op; } prim;                    /* PRIM singleton: its PrimOp */
+        struct { struct Closure *x; u64 op; } prim1; /* PRIM1: op applied to x (x first, so the one-argument PAP layout holds) */
     } payload;
 } Closure;
 
@@ -108,10 +111,15 @@ typedef struct STG {
     jmp_buf exit_jmp;
     Closure *result;
     
-    /* Pre-built primitive closures (shared singletons) */
+    /* Pre-built primitive closures (shared singletons): S K I B C T R and one per word primitive */
     Closure *prim_S;
     Closure *prim_K;
     Closure *prim_I;
+    Closure *prim_B;
+    Closure *prim_C;
+    Closure *prim_T;
+    Closure *prim_R;
+    Closure *prim_op[PRIM_COUNT];
     
     /* GC statistics */
     u64 gc_count;
@@ -133,6 +141,52 @@ static Closure *entry_S2(STG *stg, Closure *self);
 static Closure *entry_K1(STG *stg, Closure *self);
 static Closure *entry_AP(STG *stg, Closure *self);
 static Closure *entry_IND(STG *stg, Closure *self);
+static Closure *entry_B(STG *stg, Closure *self);
+static Closure *entry_B1(STG *stg, Closure *self);
+static Closure *entry_B2(STG *stg, Closure *self);
+static Closure *entry_C(STG *stg, Closure *self);
+static Closure *entry_C1(STG *stg, Closure *self);
+static Closure *entry_C2(STG *stg, Closure *self);
+static Closure *entry_T(STG *stg, Closure *self);
+static Closure *entry_T1(STG *stg, Closure *self);
+static Closure *entry_R(STG *stg, Closure *self);
+static Closure *entry_R1(STG *stg, Closure *self);
+static Closure *entry_R2(STG *stg, Closure *self);
+static Closure *entry_WORD(STG *stg, Closure *self);
+static Closure *entry_PRIM(STG *stg, Closure *self);
+static Closure *entry_PRIM1(STG *stg, Closure *self);
+
+/* Kinds by shape: a leaf value (one word, or a word/primitive with its datum); a PAP with one captured argument
+ * (x at payload word 1); a PAP with two (x, y at words 1, 2). */
+static int is_leaf(Closure *c) {
+    EntryCode e = c->entry;
+    return e == entry_S || e == entry_K || e == entry_I || e == entry_B || e == entry_C || e == entry_T || e == entry_R ||
+           e == entry_WORD || e == entry_PRIM;
+}
+static int pap1_kind(EntryCode e) {
+    return e == entry_S1 || e == entry_K1 || e == entry_B1 || e == entry_C1 || e == entry_T1 || e == entry_R1 || e == entry_PRIM1;
+}
+static int pap2_kind(EntryCode e) {
+    return e == entry_S2 || e == entry_B2 || e == entry_C2 || e == entry_R2;
+}
+
+/* The singletons live at the start of every semispace, in this order:
+ * S K I B C T R (one word each), then the word primitives (two words each: entry, op). */
+#define SINGLETON_WORDS (7 + 2 * PRIM_COUNT)
+static void singletons_build(STG *stg, Closure *base) {
+    char *p = (char*)base;
+    Closure *c;
+    c = (Closure*)p; c->entry = entry_S; stg->prim_S = c; p += WORD;
+    c = (Closure*)p; c->entry = entry_K; stg->prim_K = c; p += WORD;
+    c = (Closure*)p; c->entry = entry_I; stg->prim_I = c; p += WORD;
+    c = (Closure*)p; c->entry = entry_B; stg->prim_B = c; p += WORD;
+    c = (Closure*)p; c->entry = entry_C; stg->prim_C = c; p += WORD;
+    c = (Closure*)p; c->entry = entry_T; stg->prim_T = c; p += WORD;
+    c = (Closure*)p; c->entry = entry_R; stg->prim_R = c; p += WORD;
+    for (int op = 0; op < PRIM_COUNT; op++) {
+        c = (Closure*)p; c->entry = entry_PRIM; c->payload.prim.op = (u64)op; stg->prim_op[op] = c; p += 2 * WORD;
+    }
+}
 
 /* Special marker for forwarding pointers during GC */
 static Closure *entry_FWD(STG *stg, Closure *self) {
@@ -150,19 +204,21 @@ static Closure *gc_copy(STG *stg, Closure *from, Closure **to_hp);
  * Get size of closure in words based on entry code
  */
 static int closure_size(Closure *c) {
-    if (c->entry == entry_S || c->entry == entry_K || c->entry == entry_I) {
+    EntryCode e = c->entry;
+    if (e == entry_S || e == entry_K || e == entry_I || e == entry_B || e == entry_C || e == entry_T || e == entry_R) {
         return 1;  /* just entry ptr */
     }
-    if (c->entry == entry_S1 || c->entry == entry_K1 || c->entry == entry_IND) {
+    if (pap1_kind(e) && e != entry_PRIM1) {
         return 2;  /* entry + 1 pointer */
     }
-    if (c->entry == entry_S2 || c->entry == entry_AP) {
-        return 3;  /* entry + 2 pointers */
+    if (e == entry_IND || e == entry_FWD || e == entry_WORD || e == entry_PRIM) {
+        return 2;  /* entry + 1 pointer, or entry + datum */
     }
-    if (c->entry == entry_FWD) {
-        return 2;  /* forwarding pointer */
+    if (pap2_kind(e) || e == entry_AP || e == entry_PRIM1) {
+        return 3;  /* entry + 2 pointers, or entry + pointer + datum */
     }
-    return 1;  /* unknown, assume minimal */
+    fprintf(stderr, "STG: closure of unknown kind\n");
+    abort();
 }
 
 /*
@@ -511,6 +567,346 @@ static Closure *entry_IND(STG *stg, Closure *self) {
     return stg_tail(stg, target);
 }
 
+/* ------------------------------------------------------------------------
+ * The extended leaves (2026-09-13): B C T R, words and their primitives.
+ * The rules are those of term.h; here a word passes itself on by pushing
+ * itself and entering its argument, and a primitive's continuations are
+ * the closures B2[y, op] and PRIM1[x, op] built from the rules themselves.
+ * ------------------------------------------------------------------------ */
+
+static void count_step(STG *stg) {
+    stg->steps++;
+    if (stg->max_steps && stg->steps >= stg->max_steps) {
+        longjmp(stg->exit_jmp, 2);
+    }
+}
+
+/* Allocation helpers: the caller has reserved the words */
+static Closure *pap1(STG *stg, EntryCode e, Closure *x) {
+    Closure *c = stg_alloc(stg, 2);
+    c->entry = e;
+    c->payload.s1.x = x;
+    return c;
+}
+static Closure *pap2(STG *stg, EntryCode e, Closure *x, Closure *y) {
+    Closure *c = stg_alloc(stg, 3);
+    c->entry = e;
+    c->payload.s2.x = x;
+    c->payload.s2.y = y;
+    return c;
+}
+static Closure *mk_ap(STG *stg, Closure *f, Closure *arg) {
+    Closure *c = stg_alloc(stg, 3);
+    c->entry = entry_AP;
+    c->payload.ap.f = f;
+    c->payload.ap.arg = arg;
+    return c;
+}
+static Closure *mk_word(STG *stg, u64 w) {
+    Closure *c = stg_alloc(stg, 2);
+    c->entry = entry_WORD;
+    c->payload.word = w;
+    return c;
+}
+static Closure *mk_prim1(STG *stg, u64 op, Closure *x) {
+    Closure *c = stg_alloc(stg, 3);
+    c->entry = entry_PRIM1;
+    c->payload.prim1.x = x;
+    c->payload.prim1.op = op;
+    return c;
+}
+
+/*
+ * B x y z -> x (y z)
+ */
+static Closure *entry_B(STG *stg, Closure *self) {
+    (void)self;
+    int n = stg_stack_size(stg);
+    if (n == 0) return stg->prim_B;
+    if (n == 1) {
+        stg_reserve(stg, 2);
+        Closure *x = stg_pop(stg);
+        return pap1(stg, entry_B1, x);
+    }
+    if (n == 2) {
+        stg_reserve(stg, 3);
+        Closure *x = stg_pop(stg);
+        Closure *y = stg_pop(stg);
+        return pap2(stg, entry_B2, x, y);
+    }
+    count_step(stg);
+    stg_reserve(stg, 3);
+    Closure *x = stg_pop(stg);
+    Closure *y = stg_pop(stg);
+    Closure *z = stg_pop(stg);
+    stg_push(stg, mk_ap(stg, y, z));
+    return stg_tail(stg, x);
+}
+
+static Closure *entry_B1(STG *stg, Closure *self) {
+    int n = stg_stack_size(stg);
+    if (n == 0) return self;
+    stg->current_node = self;
+    stg_reserve(stg, 3);
+    self = stg->current_node;
+    Closure *x = self->payload.s1.x;
+    if (n == 1) {
+        Closure *y = stg_pop(stg);
+        return pap2(stg, entry_B2, x, y);
+    }
+    count_step(stg);
+    Closure *y = stg_pop(stg);
+    Closure *z = stg_pop(stg);
+    stg_push(stg, mk_ap(stg, y, z));
+    return stg_tail(stg, x);
+}
+
+static Closure *entry_B2(STG *stg, Closure *self) {
+    if (stg_stack_size(stg) < 1) return self;
+    count_step(stg);
+    stg->current_node = self;
+    stg_reserve(stg, 3);
+    self = stg->current_node;
+    Closure *x = self->payload.s2.x;
+    Closure *y = self->payload.s2.y;
+    Closure *z = stg_pop(stg);
+    stg_push(stg, mk_ap(stg, y, z));
+    return stg_tail(stg, x);
+}
+
+/*
+ * C x y z -> x z y   (no allocation: y then z go back on the stack)
+ */
+static Closure *entry_C(STG *stg, Closure *self) {
+    (void)self;
+    int n = stg_stack_size(stg);
+    if (n == 0) return stg->prim_C;
+    if (n == 1) {
+        stg_reserve(stg, 2);
+        Closure *x = stg_pop(stg);
+        return pap1(stg, entry_C1, x);
+    }
+    if (n == 2) {
+        stg_reserve(stg, 3);
+        Closure *x = stg_pop(stg);
+        Closure *y = stg_pop(stg);
+        return pap2(stg, entry_C2, x, y);
+    }
+    count_step(stg);
+    Closure *x = stg_pop(stg);
+    Closure *y = stg_pop(stg);
+    Closure *z = stg_pop(stg);
+    stg_push(stg, y);
+    stg_push(stg, z);
+    return stg_tail(stg, x);
+}
+
+static Closure *entry_C1(STG *stg, Closure *self) {
+    int n = stg_stack_size(stg);
+    if (n == 0) return self;
+    if (n == 1) {
+        stg->current_node = self;
+        stg_reserve(stg, 3);
+        self = stg->current_node;
+        Closure *y = stg_pop(stg);
+        return pap2(stg, entry_C2, self->payload.s1.x, y);
+    }
+    count_step(stg);
+    Closure *x = self->payload.s1.x;
+    Closure *y = stg_pop(stg);
+    Closure *z = stg_pop(stg);
+    stg_push(stg, y);
+    stg_push(stg, z);
+    return stg_tail(stg, x);
+}
+
+static Closure *entry_C2(STG *stg, Closure *self) {
+    if (stg_stack_size(stg) < 1) return self;
+    count_step(stg);
+    Closure *x = self->payload.s2.x;
+    Closure *y = self->payload.s2.y;
+    Closure *z = stg_pop(stg);
+    stg_push(stg, y);
+    stg_push(stg, z);
+    return stg_tail(stg, x);
+}
+
+/*
+ * T x f -> f x
+ */
+static Closure *entry_T(STG *stg, Closure *self) {
+    (void)self;
+    int n = stg_stack_size(stg);
+    if (n == 0) return stg->prim_T;
+    if (n == 1) {
+        stg_reserve(stg, 2);
+        Closure *x = stg_pop(stg);
+        return pap1(stg, entry_T1, x);
+    }
+    count_step(stg);
+    Closure *x = stg_pop(stg);
+    Closure *f = stg_pop(stg);
+    stg_push(stg, x);
+    return stg_tail(stg, f);
+}
+
+static Closure *entry_T1(STG *stg, Closure *self) {
+    if (stg_stack_size(stg) < 1) return self;
+    count_step(stg);
+    Closure *f = stg_pop(stg);
+    stg_push(stg, self->payload.s1.x);
+    return stg_tail(stg, f);
+}
+
+/*
+ * R x y z -> y z x
+ */
+static Closure *entry_R(STG *stg, Closure *self) {
+    (void)self;
+    int n = stg_stack_size(stg);
+    if (n == 0) return stg->prim_R;
+    if (n == 1) {
+        stg_reserve(stg, 2);
+        Closure *x = stg_pop(stg);
+        return pap1(stg, entry_R1, x);
+    }
+    if (n == 2) {
+        stg_reserve(stg, 3);
+        Closure *x = stg_pop(stg);
+        Closure *y = stg_pop(stg);
+        return pap2(stg, entry_R2, x, y);
+    }
+    count_step(stg);
+    Closure *x = stg_pop(stg);
+    Closure *y = stg_pop(stg);
+    Closure *z = stg_pop(stg);
+    stg_push(stg, x);
+    stg_push(stg, z);
+    return stg_tail(stg, y);
+}
+
+static Closure *entry_R1(STG *stg, Closure *self) {
+    int n = stg_stack_size(stg);
+    if (n == 0) return self;
+    if (n == 1) {
+        stg->current_node = self;
+        stg_reserve(stg, 3);
+        self = stg->current_node;
+        Closure *y = stg_pop(stg);
+        return pap2(stg, entry_R2, self->payload.s1.x, y);
+    }
+    count_step(stg);
+    Closure *x = self->payload.s1.x;
+    Closure *y = stg_pop(stg);
+    Closure *z = stg_pop(stg);
+    stg_push(stg, x);
+    stg_push(stg, z);
+    return stg_tail(stg, y);
+}
+
+static Closure *entry_R2(STG *stg, Closure *self) {
+    if (stg_stack_size(stg) < 1) return self;
+    count_step(stg);
+    Closure *x = self->payload.s2.x;
+    Closure *y = self->payload.s2.y;
+    Closure *z = stg_pop(stg);
+    stg_push(stg, x);
+    stg_push(stg, z);
+    return stg_tail(stg, y);
+}
+
+/*
+ * #w f -> f #w
+ */
+static Closure *entry_WORD(STG *stg, Closure *self) {
+    if (stg_stack_size(stg) < 1) return self;
+    count_step(stg);
+    Closure *f = stg_pop(stg);
+    stg_push(stg, self);
+    return stg_tail(stg, f);
+}
+
+/* The value of op #a #b: a word, a Scott boolean (K, K I) or a Scott pair C (T a) b; at most 9 words */
+#define PRIM_VALUE_WORDS 9
+static Closure *prim_pair(STG *stg, u64 a, u64 b) {
+    Closure *t1 = pap1(stg, entry_T1, mk_word(stg, a));
+    return pap2(stg, entry_C2, t1, mk_word(stg, b));
+}
+static Closure *prim_bool(STG *stg, int b) {
+    return b ? stg->prim_K : pap1(stg, entry_K1, stg->prim_I);
+}
+static Closure *prim_value(STG *stg, u64 op, u64 a, u64 b) {
+    switch ((PrimOp)op) {
+    case PRIM_ADD: return mk_word(stg, a + b);
+    case PRIM_SUB: return mk_word(stg, a - b);
+    case PRIM_MUL: return mk_word(stg, a * b);
+    case PRIM_AND: return mk_word(stg, a & b);
+    case PRIM_OR:  return mk_word(stg, a | b);
+    case PRIM_XOR: return mk_word(stg, a ^ b);
+    case PRIM_SHL: return mk_word(stg, b >= 64 ? 0 : a << b);
+    case PRIM_SHR: return mk_word(stg, b >= 64 ? 0 : a >> b);
+    case PRIM_EQ:  return prim_bool(stg, a == b);
+    case PRIM_LT:  return prim_bool(stg, a < b);
+    case PRIM_ADDC: { u64 s = a + b; return prim_pair(stg, s, s < a); }
+    case PRIM_SUBB: return prim_pair(stg, a - b, a < b);
+    case PRIM_MULL: {
+        unsigned __int128 m = (unsigned __int128)a * b;
+        return prim_pair(stg, (u64)m, (u64)(m >> 64));
+    }
+    case PRIM_DIVMOD:
+        if (b == 0) return prim_pair(stg, 0, a);
+        return prim_pair(stg, a / b, a % b);
+    default:
+        fprintf(stderr, "STG: unknown primitive %llu\n", (unsigned long long)op);
+        longjmp(stg->exit_jmp, 1);
+    }
+}
+
+/*
+ * op x y: the rules of term.h. PRIM_VALUE_WORDS reserved; x and y popped.
+ */
+static Closure *prim_step(STG *stg, u64 op, Closure *x, Closure *y) {
+    Closure *xv = x;
+    while (xv->entry == entry_IND) xv = xv->payload.ind.target;
+    if (xv->entry != entry_WORD) {                       /* x (B y op) */
+        stg_push(stg, pap2(stg, entry_B2, y, stg->prim_op[op]));
+        return stg_tail(stg, x);
+    }
+    Closure *yv = y;
+    while (yv->entry == entry_IND) yv = yv->payload.ind.target;
+    if (yv->entry != entry_WORD) {                       /* y (op x) */
+        stg_push(stg, mk_prim1(stg, op, xv));
+        return stg_tail(stg, y);
+    }
+    return prim_value(stg, op, xv->payload.word, yv->payload.word);
+}
+
+static Closure *entry_PRIM(STG *stg, Closure *self) {
+    int n = stg_stack_size(stg);
+    if (n == 0) return self;
+    u64 op = self->payload.prim.op;                      /* self is a singleton: it does not move */
+    if (n == 1) {
+        stg_reserve(stg, 3);
+        Closure *x = stg_pop(stg);
+        return mk_prim1(stg, op, x);
+    }
+    count_step(stg);
+    stg_reserve(stg, PRIM_VALUE_WORDS);
+    Closure *x = stg_pop(stg);
+    Closure *y = stg_pop(stg);
+    return prim_step(stg, op, x, y);
+}
+
+static Closure *entry_PRIM1(STG *stg, Closure *self) {
+    if (stg_stack_size(stg) < 1) return self;
+    count_step(stg);
+    stg->current_node = self;
+    stg_reserve(stg, PRIM_VALUE_WORDS);
+    self = stg->current_node;
+    Closure *y = stg_pop(stg);
+    return prim_step(stg, self->payload.prim1.op, self->payload.prim1.x, y);
+}
+
 /*
  * Enter a closure - THE ONLY DISPATCH POINT
  * This is now just a single indirect call, not a switch!
@@ -559,16 +955,15 @@ static Closure *stg_enter(STG *stg, Closure *c) {
 
 typedef enum {
     WORK_NORMALIZE,     /* normalize closure, result goes to 'result' */
-    WORK_S1_DONE,       /* S1 child done, rebuild if changed */
-    WORK_S2_X_DONE,     /* S2 first child done, continue to y */
-    WORK_S2_Y_DONE,     /* S2 both children done, rebuild if changed */
-    WORK_K1_DONE,       /* K1 child done, rebuild if changed */
+    WORK_P1_DONE,       /* a one-argument PAP's child done, rebuild if changed */
+    WORK_P2_X_DONE,     /* a two-argument PAP's first child done, continue to y */
+    WORK_P2_Y_DONE,     /* both children done, rebuild if changed */
 } WorkType;
 
 typedef struct {
     WorkType type;
     Closure *closure;      /* closure being processed */
-    Closure *saved_x;      /* for S2: save normalized x while processing y */
+    Closure *saved_x;      /* for two-argument PAPs: save normalized x while processing y */
 } WorkItem;
 
 typedef struct WorkStack {
@@ -611,10 +1006,9 @@ static Closure *stg_normalize(STG *stg, Closure *c) {
     /* Computed goto jump table - gcc/clang extension */
     static const void *dispatch[] = {
         &&do_normalize,
-        &&do_s1_done,
-        &&do_s2_x_done,
-        &&do_s2_y_done,
-        &&do_k1_done,
+        &&do_p1_done,
+        &&do_p2_x_done,
+        &&do_p2_y_done,
     };
     
     #define DISPATCH() do { \
@@ -630,24 +1024,19 @@ static Closure *stg_normalize(STG *stg, Closure *c) {
 do_normalize: {
     Closure *cur = stg_enter(stg, item.closure);
     
-    if (cur->entry == entry_S || cur->entry == entry_K || cur->entry == entry_I) {
+    if (is_leaf(cur)) {
         result = cur;
         DISPATCH();
     }
-    if (cur->entry == entry_S1) {
-        work_stack_push(&ws, (WorkItem){WORK_S1_DONE, cur, NULL});
+    if (pap1_kind(cur->entry)) {
+        work_stack_push(&ws, (WorkItem){WORK_P1_DONE, cur, NULL});
         work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.s1.x, NULL});
         DISPATCH();
     }
-    if (cur->entry == entry_S2) {
-        work_stack_push(&ws, (WorkItem){WORK_S2_Y_DONE, cur, NULL});
-        work_stack_push(&ws, (WorkItem){WORK_S2_X_DONE, cur, NULL});
+    if (pap2_kind(cur->entry)) {
+        work_stack_push(&ws, (WorkItem){WORK_P2_Y_DONE, cur, NULL});
+        work_stack_push(&ws, (WorkItem){WORK_P2_X_DONE, cur, NULL});
         work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.s2.x, NULL});
-        DISPATCH();
-    }
-    if (cur->entry == entry_K1) {
-        work_stack_push(&ws, (WorkItem){WORK_K1_DONE, cur, NULL});
-        work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.k1.x, NULL});
         DISPATCH();
     }
     if (cur->entry == entry_AP) {
@@ -663,18 +1052,19 @@ do_normalize: {
     DISPATCH();
 }
 
-do_s1_done: {
+do_p1_done: {
     Closure *cur = item.closure;
     Closure *x = result;
     stg->extra_roots[0] = cur;
     stg->extra_roots[1] = x;
-    stg_reserve(stg, 2);
+    stg_reserve(stg, 3);
     cur = stg->extra_roots[0];
     x = stg->extra_roots[1];
     stg->extra_roots[0] = stg->extra_roots[1] = NULL;
     if (x != cur->payload.s1.x) {
-        Closure *new_c = stg_alloc(stg, 2);
-        new_c->entry = entry_S1;
+        int size = closure_size(cur);              /* the same kind (and datum, for PRIM1), with the normalized x */
+        Closure *new_c = stg_alloc(stg, size);
+        memcpy(new_c, cur, size * WORD);
         new_c->payload.s1.x = x;
         result = new_c;
     } else {
@@ -683,14 +1073,14 @@ do_s1_done: {
     DISPATCH();
 }
 
-do_s2_x_done: {
+do_p2_x_done: {
     Closure *cur = item.closure;
     ws.items[ws.sp - 1].saved_x = result;
     work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.s2.y, NULL});
     DISPATCH();
 }
 
-do_s2_y_done: {
+do_p2_y_done: {
     Closure *cur = item.closure;
     Closure *x = item.saved_x;
     Closure *y = result;
@@ -703,31 +1093,7 @@ do_s2_y_done: {
     y = stg->extra_roots[2];
     stg->extra_roots[0] = stg->extra_roots[1] = stg->extra_roots[2] = NULL;
     if (x != cur->payload.s2.x || y != cur->payload.s2.y) {
-        Closure *new_c = stg_alloc(stg, 3);
-        new_c->entry = entry_S2;
-        new_c->payload.s2.x = x;
-        new_c->payload.s2.y = y;
-        result = new_c;
-    } else {
-        result = cur;
-    }
-    DISPATCH();
-}
-
-do_k1_done: {
-    Closure *cur = item.closure;
-    Closure *x = result;
-    stg->extra_roots[0] = cur;
-    stg->extra_roots[1] = x;
-    stg_reserve(stg, 2);
-    cur = stg->extra_roots[0];
-    x = stg->extra_roots[1];
-    stg->extra_roots[0] = stg->extra_roots[1] = NULL;
-    if (x != cur->payload.k1.x) {
-        Closure *new_c = stg_alloc(stg, 2);
-        new_c->entry = entry_K1;
-        new_c->payload.k1.x = x;
-        result = new_c;
+        result = pap2(stg, cur->entry, x, y);
     } else {
         result = cur;
     }
@@ -816,6 +1182,25 @@ static Closure *term_to_stg(STG *stg, SKITerm *t) {
             case TERM_I:
                 result = stg->prim_I;
                 break;
+            case TERM_B:
+                result = stg->prim_B;
+                break;
+            case TERM_C:
+                result = stg->prim_C;
+                break;
+            case TERM_T:
+                result = stg->prim_T;
+                break;
+            case TERM_R:
+                result = stg->prim_R;
+                break;
+            case TERM_PRIM:
+                result = stg->prim_op[item.term->op];
+                break;
+            case TERM_WORD:
+                stg_reserve(stg, 2);
+                result = mk_word(stg, item.term->word);
+                break;
             case TERM_APP:
                 conv_stack_push(&cs, (ConvItem){CONV_APP_BUILD, item.term, NULL});
                 conv_stack_push(&cs, (ConvItem){CONV_APP_RIGHT, item.term, NULL});
@@ -861,10 +1246,9 @@ static Closure *term_to_stg(STG *stg, SKITerm *t) {
 
 typedef enum {
     BACK_VISIT,
-    BACK_S1_DONE,
-    BACK_S2_X_DONE,
-    BACK_S2_BUILD,
-    BACK_K1_DONE,
+    BACK_P1_DONE,
+    BACK_P2_X_DONE,
+    BACK_P2_BUILD,
     BACK_AP_LEFT_DONE,
     BACK_AP_BUILD,
 } BackType;
@@ -909,6 +1293,23 @@ static BackItem back_stack_pop(BackStack *bs) {
     return bs->items[--bs->sp];
 }
 
+/* A leaf closure, or the head of a PAP, as a term */
+static SKITerm *head_term(SKIPool *pool, Closure *c) {
+    EntryCode e = c->entry;
+    if (e == entry_S || e == entry_S1 || e == entry_S2) return ski_s(pool);
+    if (e == entry_K || e == entry_K1) return ski_k(pool);
+    if (e == entry_I) return ski_i(pool);
+    if (e == entry_B || e == entry_B1 || e == entry_B2) return ski_b(pool);
+    if (e == entry_C || e == entry_C1 || e == entry_C2) return ski_c(pool);
+    if (e == entry_T || e == entry_T1) return ski_t(pool);
+    if (e == entry_R || e == entry_R1 || e == entry_R2) return ski_r(pool);
+    if (e == entry_WORD) return ski_word(pool, c->payload.word);
+    if (e == entry_PRIM) return ski_prim(pool, (PrimOp)c->payload.prim.op);
+    if (e == entry_PRIM1) return ski_prim(pool, (PrimOp)c->payload.prim1.op);
+    fprintf(stderr, "STG: cannot read back a closure of this kind\n");
+    abort();
+}
+
 static SKITerm *stg_to_term(SKIPool *pool, Closure *c) {
     BackStack bs;
     back_stack_init(&bs);
@@ -929,27 +1330,17 @@ static SKITerm *stg_to_term(SKIPool *pool, Closure *c) {
                 cur = cur->payload.ind.target;
             }
             
-            if (cur->entry == entry_S) {
-                result = ski_s(pool);
+            if (is_leaf(cur)) {
+                result = head_term(pool, cur);
             }
-            else if (cur->entry == entry_K) {
-                result = ski_k(pool);
-            }
-            else if (cur->entry == entry_I) {
-                result = ski_i(pool);
-            }
-            else if (cur->entry == entry_S1) {
-                back_stack_push(&bs, (BackItem){BACK_S1_DONE, cur, NULL});
+            else if (pap1_kind(cur->entry)) {
+                back_stack_push(&bs, (BackItem){BACK_P1_DONE, cur, NULL});
                 back_stack_push(&bs, (BackItem){BACK_VISIT, cur->payload.s1.x, NULL});
             }
-            else if (cur->entry == entry_S2) {
-                back_stack_push(&bs, (BackItem){BACK_S2_BUILD, cur, NULL});
-                back_stack_push(&bs, (BackItem){BACK_S2_X_DONE, cur, NULL});
+            else if (pap2_kind(cur->entry)) {
+                back_stack_push(&bs, (BackItem){BACK_P2_BUILD, cur, NULL});
+                back_stack_push(&bs, (BackItem){BACK_P2_X_DONE, cur, NULL});
                 back_stack_push(&bs, (BackItem){BACK_VISIT, cur->payload.s2.x, NULL});
-            }
-            else if (cur->entry == entry_K1) {
-                back_stack_push(&bs, (BackItem){BACK_K1_DONE, cur, NULL});
-                back_stack_push(&bs, (BackItem){BACK_VISIT, cur->payload.k1.x, NULL});
             }
             else if (cur->entry == entry_AP) {
                 back_stack_push(&bs, (BackItem){BACK_AP_BUILD, cur, NULL});
@@ -957,34 +1348,29 @@ static SKITerm *stg_to_term(SKIPool *pool, Closure *c) {
                 back_stack_push(&bs, (BackItem){BACK_VISIT, cur->payload.ap.f, NULL});
             }
             else {
-                result = ski_i(pool);  /* fallback */
+                fprintf(stderr, "STG: cannot read back a closure of this kind\n");
+                abort();
             }
             break;
         }
         
-        case BACK_S1_DONE: {
+        case BACK_P1_DONE: {
             SKITerm *x = result;
-            result = ski_app(pool, ski_s(pool), x);
+            result = ski_app(pool, head_term(pool, item.closure), x);
             break;
         }
         
-        case BACK_S2_X_DONE: {
+        case BACK_P2_X_DONE: {
             /* x done, save and do y */
             bs.items[bs.sp - 1].left_result = result;
             back_stack_push(&bs, (BackItem){BACK_VISIT, item.closure->payload.s2.y, NULL});
             break;
         }
         
-        case BACK_S2_BUILD: {
+        case BACK_P2_BUILD: {
             SKITerm *x = item.left_result;
             SKITerm *y = result;
-            result = ski_app(pool, ski_app(pool, ski_s(pool), x), y);
-            break;
-        }
-        
-        case BACK_K1_DONE: {
-            SKITerm *x = result;
-            result = ski_app(pool, ski_k(pool), x);
+            result = ski_app(pool, ski_app(pool, head_term(pool, item.closure), x), y);
             break;
         }
         
@@ -1031,9 +1417,11 @@ static int in_from_space(STG *stg, Closure *p) {
 static Closure *gc_copy(STG *stg, Closure *from, Closure **to_hp) {
     if (!from) return NULL;
     
-    /* Primitives are allocated at fixed locations at start - don't copy */
-    if (from == stg->prim_S || from == stg->prim_K || from == stg->prim_I) {
-        return from;
+    /* The singletons at the start of the from-space are rebuilt at the start of the
+     * to-space, and every space keeps them, so a pointer to one stays valid as it is */
+    {
+        char *base = (char*)stg->space[stg->active_space];
+        if ((char*)from >= base && (char*)from < base + SINGLETON_WORDS * WORD) return from;
     }
     
     /* If not in from-space, don't copy (shouldn't happen) */
@@ -1064,20 +1452,14 @@ static Closure *gc_copy(STG *stg, Closure *from, Closure **to_hp) {
  * Scavenge a closure - update its pointers to point to to-space
  */
 static void gc_scavenge(STG *stg, Closure *c, Closure **to_hp) {
-    if (c->entry == entry_S1) {
-        c->payload.s1.x = gc_copy(stg, c->payload.s1.x, to_hp);
-    } else if (c->entry == entry_S2) {
+    EntryCode e = c->entry;
+    if (pap1_kind(e) || e == entry_IND) {
+        c->payload.s1.x = gc_copy(stg, c->payload.s1.x, to_hp);        /* one pointer at word 1 (PRIM1's op is a datum) */
+    } else if (pap2_kind(e) || e == entry_AP) {
         c->payload.s2.x = gc_copy(stg, c->payload.s2.x, to_hp);
         c->payload.s2.y = gc_copy(stg, c->payload.s2.y, to_hp);
-    } else if (c->entry == entry_K1) {
-        c->payload.k1.x = gc_copy(stg, c->payload.k1.x, to_hp);
-    } else if (c->entry == entry_AP) {
-        c->payload.ap.f = gc_copy(stg, c->payload.ap.f, to_hp);
-        c->payload.ap.arg = gc_copy(stg, c->payload.ap.arg, to_hp);
-    } else if (c->entry == entry_IND) {
-        c->payload.ind.target = gc_copy(stg, c->payload.ind.target, to_hp);
     }
-    /* S, K, I have no pointers to scavenge */
+    /* leaves, words and primitives have no pointers to scavenge */
 }
 
 /*
@@ -1094,21 +1476,10 @@ static void stg_gc(STG *stg) {
     Closure *to_hp = to_base;  /* allocation pointer in to-space */
     Closure *scan = to_base;    /* scan pointer for scavenging */
     
-    /* First, copy the primitives to the new space */
-    /* (They're singletons, need to be in both spaces) */
-    Closure *new_S = to_hp;
-    new_S->entry = entry_S;
-    to_hp = (Closure*)((char*)to_hp + WORD);
-    
-    Closure *new_K = to_hp;
-    new_K->entry = entry_K;
-    to_hp = (Closure*)((char*)to_hp + WORD);
-    
-    Closure *new_I = to_hp;
-    new_I->entry = entry_I;
-    to_hp = (Closure*)((char*)to_hp + WORD);
-    
-    scan = to_hp;  /* don't scavenge primitives */
+    /* First, the singletons at the start of the new space (every space keeps them) */
+    singletons_build(stg, to_base);
+    to_hp = (Closure*)((char*)to_base + SINGLETON_WORDS * WORD);
+    scan = to_hp;  /* don't scavenge the singletons */
     
     /* Copy roots: current node being evaluated */
     if (stg->current_node) {
@@ -1156,11 +1527,6 @@ static void stg_gc(STG *stg) {
         scan = (Closure*)((char*)scan + size * WORD);
     }
     
-    /* Update primitives */
-    stg->prim_S = new_S;
-    stg->prim_K = new_K;
-    stg->prim_I = new_I;
-    
     /* Swap spaces */
     stg->active_space = to_space;
     stg->hp = to_hp;
@@ -1197,15 +1563,9 @@ static void stg_init(void) {
     g_stg->update_stack = malloc(g_stg->update_size * sizeof(g_stg->update_stack[0]));
     g_stg->update_sp = 0;
     
-    /* Pre-build primitive closures (singletons) */
-    g_stg->prim_S = stg_alloc(g_stg, 1);
-    g_stg->prim_S->entry = entry_S;
-    
-    g_stg->prim_K = stg_alloc(g_stg, 1);
-    g_stg->prim_K->entry = entry_K;
-    
-    g_stg->prim_I = stg_alloc(g_stg, 1);
-    g_stg->prim_I->entry = entry_I;
+    /* Pre-build the singletons */
+    singletons_build(g_stg, g_stg->space[0]);
+    g_stg->hp = (Closure*)((char*)g_stg->space[0] + SINGLETON_WORDS * WORD);
     
     g_stg->gc_count = 0;
 }
@@ -1216,7 +1576,7 @@ static void stg_init(void) {
 static void stg_reset(void) {
     /* Reset to space 0, preserving primitives at start */
     g_stg->active_space = 0;
-    g_stg->hp = (Closure*)((char*)g_stg->space[0] + 3 * WORD);
+    g_stg->hp = (Closure*)((char*)g_stg->space[0] + SINGLETON_WORDS * WORD);
     g_stg->heap_end = (Closure*)((char*)g_stg->space[0] + g_stg->heap_size);
     g_stg->sp = g_stg->stack_base;
     g_stg->update_sp = 0;
@@ -1229,13 +1589,8 @@ static void stg_reset(void) {
     g_stg->steps = 0;
     g_stg->max_steps = 0;
     
-    /* Re-establish primitives at start of space 0 */
-    g_stg->prim_S = g_stg->space[0];
-    g_stg->prim_S->entry = entry_S;
-    g_stg->prim_K = (Closure*)((char*)g_stg->space[0] + WORD);
-    g_stg->prim_K->entry = entry_K;
-    g_stg->prim_I = (Closure*)((char*)g_stg->space[0] + 2 * WORD);
-    g_stg->prim_I->entry = entry_I;
+    /* Re-establish the singletons at the start of space 0 */
+    singletons_build(g_stg, g_stg->space[0]);
 }
 
 /*
