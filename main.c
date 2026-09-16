@@ -285,7 +285,16 @@ int main(int argc, char **argv) {
         ski_fprint(stderr, term);
         fprintf(stderr, "\n");
     }
-    
+
+    /* The limb lists run on the simple interpreter: their primitives are the C list of limbs itself
+     * (bn.h), which its cells carry directly. The STG machine and the native JIT take them next;
+     * until then a program that uses one is refused here rather than misrun. */
+    if (!use_simple && ski_uses_bigs(term)) {
+        ski_unref(&pool, term);
+        pool_free(&pool);
+        ski_refuse_limb(use_native ? "the native JIT" : "the STG machine");
+    }
+
     /* Stream I/O mode: the program is a function from the input stream to
      * the output stream; the driver forces it one WHNF at a time (io.h). */
     if (io_mode) {

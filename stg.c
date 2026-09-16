@@ -1202,6 +1202,10 @@ static Closure *term_to_stg(STG *stg, SKITerm *t) {
                 stg_reserve(stg, 2);
                 result = mk_word(stg, item.term->word);
                 break;
+            case TERM_BIG:
+                /* A limb list runs on the simple interpreter: its primitives are the C list of limbs
+                   itself. main.c refuses one before the STG is entered; this is the backstop. */
+                ski_refuse_limb("the STG machine");
             case TERM_APP:
                 conv_stack_push(&cs, (ConvItem){CONV_APP_BUILD, item.term, NULL});
                 conv_stack_push(&cs, (ConvItem){CONV_APP_RIGHT, item.term, NULL});
