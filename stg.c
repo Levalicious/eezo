@@ -59,6 +59,7 @@ typedef struct Closure {
         struct { struct Closure *f, *arg; } ap;     /* f @ arg */
         struct { struct Closure *target; } ind;     /* -> target (also used as forwarding ptr) */
         u64 word;                                   /* WORD: the machine word (not a pointer) */
+        struct { u64 n; } big;                      /* BIG: the limb count; the limbs are the words after this one (bn.h's list, in the heap) */
         struct { u64 op; } prim;                    /* PRIM singleton: its PrimOp */
         struct { struct Closure *x; u64 op; } prim1; /* PRIM1: op applied to x (x first, so the one-argument PAP layout holds) */
     } payload;
@@ -154,6 +155,7 @@ static Closure *entry_R(STG *stg, Closure *self);
 static Closure *entry_R1(STG *stg, Closure *self);
 static Closure *entry_R2(STG *stg, Closure *self);
 static Closure *entry_WORD(STG *stg, Closure *self);
+static Closure *entry_BIG(STG *stg, Closure *self);
 static Closure *entry_PRIM(STG *stg, Closure *self);
 static Closure *entry_PRIM1(STG *stg, Closure *self);
 
@@ -162,7 +164,7 @@ static Closure *entry_PRIM1(STG *stg, Closure *self);
 static int is_leaf(Closure *c) {
     EntryCode e = c->entry;
     return e == entry_S || e == entry_K || e == entry_I || e == entry_B || e == entry_C || e == entry_T || e == entry_R ||
-           e == entry_WORD || e == entry_PRIM;
+           e == entry_WORD || e == entry_BIG || e == entry_PRIM;
 }
 static int pap1_kind(EntryCode e) {
     return e == entry_S1 || e == entry_K1 || e == entry_B1 || e == entry_C1 || e == entry_T1 || e == entry_R1 || e == entry_PRIM1;
@@ -214,6 +216,9 @@ static int closure_size(Closure *c) {
     }
     if (e == entry_IND || e == entry_FWD || e == entry_WORD || e == entry_PRIM) {
         return 2;  /* entry + 1 pointer, or entry + datum */
+    }
+    if (e == entry_BIG) {
+        return 2 + (int)c->payload.big.n;  /* entry + the count word + the limbs, LSB first */
     }
     if (pap2_kind(e) || e == entry_AP || e == entry_PRIM1) {
         return 3;  /* entry + 2 pointers, or entry + pointer + datum */
@@ -609,6 +614,28 @@ static Closure *mk_word(STG *stg, u64 w) {
     c->payload.word = w;
     return c;
 }
+
+/*
+ * The limb list in the heap: the count word, then the limbs LSB first - bn.h's list, so the bn_* functions
+ * read a closure's limbs where they lie (big_of hands them a Bn over the closure's own words) and a result
+ * is copied back in. No leading zero limb, and zero is the empty list, as bn.h has it.
+ */
+static Closure *mk_big(STG *stg, const Bn *b) {
+    Closure *c = stg_alloc(stg, 2 + b->n);
+    c->entry = entry_BIG;
+    c->payload.big.n = (u64)b->n;
+    u64 *limb = (u64 *)c + 2;
+    for (int i = 0; i < b->n; i++) limb[i] = b->limb[i];
+    return c;
+}
+/* a closure's limbs as a Bn: a word is the one-limb list it stands for, and zero is the empty one (term.c's limb_of) */
+static const Bn *big_of(Closure *c, Bn *tmp) {
+    if (c->entry == entry_BIG) { tmp->limb = (u64 *)c + 2; tmp->n = (int)c->payload.big.n; return tmp; }
+    tmp->limb = c->payload.word ? &c->payload.word : NULL;
+    tmp->n = c->payload.word ? 1 : 0;
+    return tmp;
+}
+static int limb_operand(Closure *c) { return c->entry == entry_BIG || c->entry == entry_WORD; }
 static Closure *mk_prim1(STG *stg, u64 op, Closure *x) {
     Closure *c = stg_alloc(stg, 3);
     c->entry = entry_PRIM1;
@@ -827,6 +854,18 @@ static Closure *entry_WORD(STG *stg, Closure *self) {
     return stg_tail(stg, f);
 }
 
+/*
+ * #b f -> f #b: a limb list passes itself, so a limb primitive reaches the C list of limbs (bn.h) with
+ * both of its operands - the same rule as term.c's TERM_BIG, and the same one the word above follows.
+ */
+static Closure *entry_BIG(STG *stg, Closure *self) {
+    if (stg_stack_size(stg) < 1) return self;
+    count_step(stg);
+    Closure *f = stg_pop(stg);
+    stg_push(stg, self);
+    return stg_tail(stg, f);
+}
+
 /* The value of op #a #b: a word, a Scott boolean (K, K I) or a Scott pair C (T a) b; at most 9 words */
 #define PRIM_VALUE_WORDS 9
 static Closure *prim_pair(STG *stg, u64 a, u64 b) {
@@ -835,6 +874,42 @@ static Closure *prim_pair(STG *stg, u64 a, u64 b) {
 }
 static Closure *prim_bool(STG *stg, int b) {
     return b ? stg->prim_K : pap1(stg, entry_K1, stg->prim_I);
+}
+
+/*
+ * The C list evaluating itself: one pass over the limbs, not a fold unfolding (term.c's prim_big_apply,
+ * on closures instead of terms). Every bn_* call is pure and its result is a fresh Bn outside the heap, so
+ * the closure's own words are read before any allocation - and a GC may only happen after them.
+ */
+static Closure *prim_big_value(STG *stg, u64 op, Closure *x, Closure *y) {
+    Bn tx, ty; const Bn *a = big_of(x, &tx), *b = big_of(y, &ty);
+    switch ((PrimOp)op) {
+    case PRIM_BADD: { Bn *r = bn_add(a, b);   Closure *c = mk_big(stg, r); bn_free(r); return c; }
+    case PRIM_BSUB: { Bn *r = bn_monus(a, b); Closure *c = mk_big(stg, r); bn_free(r); return c; }
+    case PRIM_BMUL: { Bn *r = bn_mul(a, b);   Closure *c = mk_big(stg, r); bn_free(r); return c; }
+    case PRIM_BDIVMOD: {
+        Bn *q, *r; bn_divmod(a, b, &q, &r);
+        stg_reserve(stg, 2 + q->n + 2 + r->n + 3 + 2);   /* the two lists, the pair, and its T pap: one allocation */
+        Closure *qc = mk_big(stg, q), *rc = mk_big(stg, r);
+        bn_free(q); bn_free(r);
+        return pap2(stg, entry_C2, pap1(stg, entry_T1, qc), rc);
+    }
+    case PRIM_BLT: case PRIM_BEQ: {
+        int cmp = bn_cmp(a, b);
+        return prim_bool(stg, (PrimOp)op == PRIM_BLT ? cmp < 0 : cmp == 0);
+    }
+    case PRIM_BPOW: { Bn *r = bn_pow(a, b); Closure *c = mk_big(stg, r); bn_free(r); return c; }
+    case PRIM_BMINV: {   /* minv x y = x ^ (y - 2) mod y: Fermat, so y's inverse is the exponent's own divisor */
+        Bn *two = bn_from_u64(2), *e = bn_monus(b, two), *pw = bn_pow(a, e), *q, *r;
+        bn_divmod(pw, b, &q, &r);
+        Closure *c = mk_big(stg, r);
+        bn_free(q); bn_free(r); bn_free(pw); bn_free(e); bn_free(two);
+        return c;
+    }
+    default:
+        fprintf(stderr, "STG: unknown limb primitive %llu\n", (unsigned long long)op);
+        longjmp(stg->exit_jmp, 1);
+    }
 }
 static Closure *prim_value(STG *stg, u64 op, u64 a, u64 b) {
     switch ((PrimOp)op) {
@@ -869,15 +944,21 @@ static Closure *prim_value(STG *stg, u64 op, u64 a, u64 b) {
 static Closure *prim_step(STG *stg, u64 op, Closure *x, Closure *y) {
     Closure *xv = x;
     while (xv->entry == entry_IND) xv = xv->payload.ind.target;
-    if (xv->entry != entry_WORD) {                       /* x (B y op) */
+    if (!limb_operand(xv)) {                             /* op x y -> x (B y op) */
         stg_push(stg, pap2(stg, entry_B2, y, stg->prim_op[op]));
         return stg_tail(stg, x);
     }
     Closure *yv = y;
     while (yv->entry == entry_IND) yv = yv->payload.ind.target;
-    if (yv->entry != entry_WORD) {                       /* y (op x) */
+    if (!limb_operand(yv)) {                             /* op x y -> y (op x) */
         stg_push(stg, mk_prim1(stg, op, xv));
         return stg_tail(stg, y);
+    }
+    if (prim_is_limb((PrimOp)op)) return prim_big_value(stg, op, xv, yv);
+    if (xv->entry == entry_BIG || yv->entry == entry_BIG) {   /* a word primitive on a limb list */
+        fprintf(stderr, "eezo: the word primitive %s takes machine words, not a limb list: "
+                        "the limb primitives (badd bsub bmul bdivmod blt beq) take limb lists\n", prim_name((PrimOp)op));
+        longjmp(stg->exit_jmp, 1);
     }
     return prim_value(stg, op, xv->payload.word, yv->payload.word);
 }
@@ -1203,9 +1284,9 @@ static Closure *term_to_stg(STG *stg, SKITerm *t) {
                 result = mk_word(stg, item.term->word);
                 break;
             case TERM_BIG:
-                /* A limb list runs on the simple interpreter: its primitives are the C list of limbs
-                   itself. main.c refuses one before the STG is entered; this is the backstop. */
-                ski_refuse_limb("the STG machine");
+                stg_reserve(stg, 2 + item.term->big->n);
+                result = mk_big(stg, item.term->big);
+                break;
             case TERM_APP:
                 conv_stack_push(&cs, (ConvItem){CONV_APP_BUILD, item.term, NULL});
                 conv_stack_push(&cs, (ConvItem){CONV_APP_RIGHT, item.term, NULL});
@@ -1309,6 +1390,7 @@ static SKITerm *head_term(SKIPool *pool, Closure *c) {
     if (e == entry_T || e == entry_T1) return ski_t(pool);
     if (e == entry_R || e == entry_R1 || e == entry_R2) return ski_r(pool);
     if (e == entry_WORD) return ski_word(pool, c->payload.word);
+    if (e == entry_BIG) return ski_big(pool, bn_from_limbs((u64*)c + 2, (int)c->payload.big.n));
     if (e == entry_PRIM) return ski_prim(pool, (PrimOp)c->payload.prim.op);
     if (e == entry_PRIM1) return ski_prim(pool, (PrimOp)c->payload.prim1.op);
     fprintf(stderr, "STG: cannot read back a closure of this kind\n");
