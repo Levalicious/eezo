@@ -1282,6 +1282,9 @@ static Closure *term_to_stg(STG *stg, SKITerm *t) {
                 stg_reserve(stg, 2);
                 result = mk_word(stg, item.term->word);
                 break;
+            case TERM_DEN:
+                /* A denoted number is the simple interpreter's kind for now: refuse it by name */
+                ski_refuse_den("the STG machine");
             case TERM_BIG:
                 stg_reserve(stg, 2 + item.term->big->n);
                 result = mk_big(stg, item.term->big);
