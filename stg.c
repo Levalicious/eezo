@@ -899,11 +899,10 @@ static Closure *prim_big_value(STG *stg, u64 op, Closure *x, Closure *y) {
         return prim_bool(stg, (PrimOp)op == PRIM_BLT ? cmp < 0 : cmp == 0);
     }
     case PRIM_BPOW: { Bn *r = bn_pow(a, b); Closure *c = mk_big(stg, r); bn_free(r); return c; }
-    case PRIM_BMINV: {   /* minv x y = x ^ (y - 2) mod y: Fermat, so y's inverse is the exponent's own divisor */
-        Bn *two = bn_from_u64(2), *e = bn_monus(b, two), *pw = bn_pow(a, e), *q, *r;
-        bn_divmod(pw, b, &q, &r);
+    case PRIM_BMINV: {   /* minv x y = x ^ (y - 2) mod y, taken modulo y all the way */
+        Bn *r = bn_minv(a, b);
         Closure *c = mk_big(stg, r);
-        bn_free(q); bn_free(r); bn_free(pw); bn_free(e); bn_free(two);
+        bn_free(r);
         return c;
     }
     default:
