@@ -156,6 +156,9 @@ static Closure *entry_R1(STG *stg, Closure *self);
 static Closure *entry_R2(STG *stg, Closure *self);
 static Closure *entry_WORD(STG *stg, Closure *self);
 static Closure *entry_BIG(STG *stg, Closure *self);
+static Closure *entry_DEN(STG *stg, Closure *self);   /* a denoted number: a power, two limb lists */
+static Closure *prim_step(STG *stg, u64 op, Closure *x, Closure *y);
+static Closure *den_make_stg(STG *stg, Bn *base, Bn *exp);
 static Closure *entry_PRIM(STG *stg, Closure *self);
 static Closure *entry_PRIM1(STG *stg, Closure *self);
 
@@ -164,7 +167,7 @@ static Closure *entry_PRIM1(STG *stg, Closure *self);
 static int is_leaf(Closure *c) {
     EntryCode e = c->entry;
     return e == entry_S || e == entry_K || e == entry_I || e == entry_B || e == entry_C || e == entry_T || e == entry_R ||
-           e == entry_WORD || e == entry_BIG || e == entry_PRIM;
+           e == entry_WORD || e == entry_BIG || e == entry_DEN || e == entry_PRIM;
 }
 static int pap1_kind(EntryCode e) {
     return e == entry_S1 || e == entry_K1 || e == entry_B1 || e == entry_C1 || e == entry_T1 || e == entry_R1 || e == entry_PRIM1;
@@ -219,6 +222,9 @@ static int closure_size(Closure *c) {
     }
     if (e == entry_BIG) {
         return 2 + (int)c->payload.big.n;  /* entry + the count word + the limbs, LSB first */
+    }
+    if (e == entry_DEN) {
+        return 3;  /* entry + the base + the exponent, both limb lists of their own kind */
     }
     if (pap2_kind(e) || e == entry_AP || e == entry_PRIM1) {
         return 3;  /* entry + 2 pointers, or entry + pointer + datum */
@@ -635,7 +641,7 @@ static const Bn *big_of(Closure *c, Bn *tmp) {
     tmp->n = c->payload.word ? 1 : 0;
     return tmp;
 }
-static int limb_operand(Closure *c) { return c->entry == entry_BIG || c->entry == entry_WORD; }
+static int limb_operand(Closure *c) { return c->entry == entry_BIG || c->entry == entry_WORD || c->entry == entry_DEN; }
 static Closure *mk_prim1(STG *stg, u64 op, Closure *x) {
     Closure *c = stg_alloc(stg, 3);
     c->entry = entry_PRIM1;
@@ -854,6 +860,22 @@ static Closure *entry_WORD(STG *stg, Closure *self) {
     return stg_tail(stg, f);
 }
 
+/* a denoted number: base and exponent, both limb lists (M17). Built after its parts: see mk_den */
+static Closure *mk_den(STG *stg, Closure *base, Closure *exp) {
+    Closure *c = stg_alloc(stg, 3);
+    c->entry = entry_DEN;
+    c->payload.s2.x = base;
+    c->payload.s2.y = exp;
+    return c;
+}
+static Closure *entry_DEN(STG *stg, Closure *self) {
+    if (stg_stack_size(stg) < 1) return self;
+    count_step(stg);
+    Closure *f = stg_pop(stg);
+    stg_push(stg, self);
+    return stg_tail(stg, f);   /* d f -> f d, as b f -> f b */
+}
+
 /*
  * #b f -> f #b: a limb list passes itself, so a limb primitive reaches the C list of limbs (bn.h) with
  * both of its operands - the same rule as term.c's TERM_BIG, and the same one the word above follows.
@@ -898,7 +920,7 @@ static Closure *prim_big_value(STG *stg, u64 op, Closure *x, Closure *y) {
         int cmp = bn_cmp(a, b);
         return prim_bool(stg, (PrimOp)op == PRIM_BLT ? cmp < 0 : cmp == 0);
     }
-    case PRIM_BPOW: { Bn *r = bn_pow(a, b); Closure *c = mk_big(stg, r); bn_free(r); return c; }
+    case PRIM_BPOW: return den_make_stg(stg, bn_copy(a), bn_copy(b));   /* built, or denoted when it cannot fit */
     case PRIM_BMINV: {   /* minv x y = x ^ (y - 2) mod y, taken modulo y all the way */
         Bn *r = bn_minv(a, b);
         Closure *c = mk_big(stg, r);
@@ -940,6 +962,51 @@ static Closure *prim_value(STG *stg, u64 op, u64 a, u64 b) {
 /*
  * op x y: the rules of term.h. PRIM_VALUE_WORDS reserved; x and y popped.
  */
+/* a ^ e on the STG's heap: a limb list when one holds it, a denoted pair when none does (M17) */
+static Closure *den_make_stg(STG *stg, Bn *base, Bn *exp) {
+    if (!bn_fits_pow(base, exp)) {
+        stg_reserve(stg, (2 + base->n) + (2 + exp->n) + 3);   /* both lists and the pair: one allocation */
+        Closure *b = mk_big(stg, base), *e = mk_big(stg, exp);
+        bn_free(base); bn_free(exp);
+        return mk_den(stg, b, e);
+    }
+    Bn *v = bn_pow(base, exp);
+    bn_free(base); bn_free(exp);
+    Closure *r = mk_big(stg, v);
+    bn_free(v);
+    return r;
+}
+/* the value itself, for a denoted number that has one: ok is 0 when no limb list holds it */
+static Closure *den_value_stg(STG *stg, Closure *c, int *ok) {
+    if (c->entry != entry_DEN) { *ok = 1; return c; }
+    Bn t1, t2;
+    const Bn *base = big_of(c->payload.s2.x, &t1), *exp = big_of(c->payload.s2.y, &t2);
+    if (!bn_fits_pow(base, exp)) { *ok = 0; return c; }
+    Bn *v = bn_pow(base, exp);
+    Closure *r = mk_big(stg, v);
+    bn_free(v);
+    *ok = 1;
+    return r;
+}
+/* A denoted number is a Nat the machine names instead of holding. The limb primitives act on it by the
+   laws stdlib/tt proves (pow_add, pow_mul), or build it when a limb list can hold it, and when neither
+   is true they refuse by name - never a silent answer. */
+static Closure *prim_den_step(STG *stg, u64 op, Closure *x, Closure *y) {
+    Bn t1, t2, t3;
+    if (op == PRIM_BPOW && x->entry == entry_DEN && y->entry != entry_DEN)
+        return den_make_stg(stg, bn_copy(big_of(x->payload.s2.x, &t1)),
+                                 bn_mul(big_of(x->payload.s2.y, &t2), big_of(y, &t3)));      /* pow_mul */
+    if (op == PRIM_BMUL && x->entry == entry_DEN && y->entry == entry_DEN
+        && bn_cmp(big_of(x->payload.s2.x, &t1), big_of(y->payload.s2.x, &t2)) == 0)
+        return den_make_stg(stg, bn_copy(big_of(x->payload.s2.x, &t1)),
+                                 bn_add(big_of(x->payload.s2.y, &t2), big_of(y->payload.s2.y, &t3)));   /* pow_add */
+    int ok = 0;
+    Closure *mx = den_value_stg(stg, x, &ok);
+    if (ok) { int ok2 = 0; Closure *my = den_value_stg(stg, y, &ok2); if (ok2) return prim_step(stg, op, mx, my); }
+    ski_refuse_den_op((PrimOp)op);
+    return NULL;   /* not reached */
+}
+
 static Closure *prim_step(STG *stg, u64 op, Closure *x, Closure *y) {
     Closure *xv = x;
     while (xv->entry == entry_IND) xv = xv->payload.ind.target;
@@ -953,6 +1020,7 @@ static Closure *prim_step(STG *stg, u64 op, Closure *x, Closure *y) {
         stg_push(stg, mk_prim1(stg, op, xv));
         return stg_tail(stg, y);
     }
+    if (xv->entry == entry_DEN || yv->entry == entry_DEN) return prim_den_step(stg, op, xv, yv);
     if (prim_is_limb((PrimOp)op)) return prim_big_value(stg, op, xv, yv);
     if (xv->entry == entry_BIG || yv->entry == entry_BIG) {   /* a word primitive on a limb list */
         fprintf(stderr, "eezo: the word primitive %s takes machine words, not a limb list: "
@@ -1282,9 +1350,14 @@ static Closure *term_to_stg(STG *stg, SKITerm *t) {
                 stg_reserve(stg, 2);
                 result = mk_word(stg, item.term->word);
                 break;
-            case TERM_DEN:
-                /* A denoted number is the simple interpreter's kind for now: refuse it by name */
-                ski_refuse_den("the STG machine");
+            case TERM_DEN: {
+                /* the components are limb lists, not terms: build them here, then the pair */
+                stg_reserve(stg, (2 + item.term->den.base->n) + (2 + item.term->den.exp->n) + 3);
+                Closure *b = mk_big(stg, item.term->den.base);
+                Closure *e = mk_big(stg, item.term->den.exp);
+                result = mk_den(stg, b, e);
+                break;
+            }
             case TERM_BIG:
                 stg_reserve(stg, 2 + item.term->big->n);
                 result = mk_big(stg, item.term->big);
@@ -1393,6 +1466,10 @@ static SKITerm *head_term(SKIPool *pool, Closure *c) {
     if (e == entry_R || e == entry_R1 || e == entry_R2) return ski_r(pool);
     if (e == entry_WORD) return ski_word(pool, c->payload.word);
     if (e == entry_BIG) return ski_big(pool, bn_from_limbs((u64*)c + 2, (int)c->payload.big.n));
+    if (e == entry_DEN) {
+        Bn t1, t2;
+        return ski_den(pool, bn_copy(big_of(c->payload.s2.x, &t1)), bn_copy(big_of(c->payload.s2.y, &t2)));
+    }
     if (e == entry_PRIM) return ski_prim(pool, (PrimOp)c->payload.prim.op);
     if (e == entry_PRIM1) return ski_prim(pool, (PrimOp)c->payload.prim1.op);
     fprintf(stderr, "STG: cannot read back a closure of this kind\n");
@@ -1544,7 +1621,7 @@ static void gc_scavenge(STG *stg, Closure *c, Closure **to_hp) {
     EntryCode e = c->entry;
     if (pap1_kind(e) || e == entry_IND) {
         c->payload.s1.x = gc_copy(stg, c->payload.s1.x, to_hp);        /* one pointer at word 1 (PRIM1's op is a datum) */
-    } else if (pap2_kind(e) || e == entry_AP) {
+    } else if (pap2_kind(e) || e == entry_AP || e == entry_DEN) {
         c->payload.s2.x = gc_copy(stg, c->payload.s2.x, to_hp);
         c->payload.s2.y = gc_copy(stg, c->payload.s2.y, to_hp);
     }
