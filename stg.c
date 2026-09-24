@@ -958,7 +958,7 @@ static Closure *prim_step(STG *stg, u64 op, Closure *x, Closure *y) {
     if (xv->entry == entry_BIG || yv->entry == entry_BIG) {   /* a word primitive on a limb list */
         fprintf(stderr, "eezo: the word primitive %s takes machine words, not a limb list: "
                         "the limb primitives (badd bsub bmul bdivmod blt beq) take limb lists\n", prim_name((PrimOp)op));
-        longjmp(stg->exit_jmp, 1);
+        exit(1);   /* the same refusal the other two evaluators make, with the same status */
     }
     return prim_value(stg, op, xv->payload.word, yv->payload.word);
 }
