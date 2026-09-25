@@ -1,3 +1,4 @@
+#include <libeezo/res.h>
 /*
  * stg.c - STG Machine for SKI Combinators
  *
@@ -153,6 +154,7 @@ static Closure *entry_R(STG *stg, Closure *self);
 static Closure *entry_R1(STG *stg, Closure *self);
 static Closure *entry_R2(STG *stg, Closure *self);
 static Closure *entry_WORD(STG *stg, Closure *self);
+static Closure *prim_step(STG *stg, u64 op, Closure *x, Closure *y);
 static Closure *entry_PRIM(STG *stg, Closure *self);
 static Closure *entry_PRIM1(STG *stg, Closure *self);
 
@@ -237,7 +239,7 @@ static Closure *stg_alloc(STG *stg, int words) {
         new_hp = (Closure*)((char*)stg->hp + words * WORD);
         
         if ((char*)new_hp >= (char*)stg->heap_end) {
-            fprintf(stderr, "STG: heap overflow after GC (need %d words)\n", words);
+            resource_die("STG: heap overflow after GC (need %d words)", words);
             longjmp(stg->exit_jmp, 1);
         }
     }
@@ -259,7 +261,7 @@ static void stg_reserve(STG *stg, int words) {
         stg_gc(stg);
         new_hp = (Closure*)((char*)stg->hp + words * WORD);
         if ((char*)new_hp >= (char*)stg->heap_end) {
-            fprintf(stderr, "STG: heap overflow after GC (need %d words)\n", words);
+            resource_die("STG: heap overflow after GC (need %d words)", words);
             longjmp(stg->exit_jmp, 1);
         }
     }
@@ -308,7 +310,7 @@ static int stg_stack_size(STG *stg) {
 static void stg_push_update(STG *stg, Closure *t) {
     if (stg->update_sp >= stg->update_size) {
         stg->update_size *= 2;
-        stg->update_stack = realloc(stg->update_stack,
+        stg->update_stack = rrealloc(stg->update_stack,
                                     stg->update_size * sizeof(stg->update_stack[0]));
         if (!stg->update_stack) {
             fprintf(stderr, "STG: update stack realloc failed\n");
@@ -608,6 +610,7 @@ static Closure *mk_word(STG *stg, u64 w) {
     c->payload.word = w;
     return c;
 }
+
 static Closure *mk_prim1(STG *stg, u64 op, Closure *x) {
     Closure *c = stg_alloc(stg, 3);
     c->entry = entry_PRIM1;
@@ -835,6 +838,7 @@ static Closure *prim_pair(STG *stg, u64 a, u64 b) {
 static Closure *prim_bool(STG *stg, int b) {
     return b ? stg->prim_K : pap1(stg, entry_K1, stg->prim_I);
 }
+
 static Closure *prim_value(STG *stg, u64 op, u64 a, u64 b) {
     switch ((PrimOp)op) {
     case PRIM_ADD: return mk_word(stg, a + b);
@@ -868,13 +872,13 @@ static Closure *prim_value(STG *stg, u64 op, u64 a, u64 b) {
 static Closure *prim_step(STG *stg, u64 op, Closure *x, Closure *y) {
     Closure *xv = x;
     while (xv->entry == entry_IND) xv = xv->payload.ind.target;
-    if (xv->entry != entry_WORD) {                       /* x (B y op) */
+    if (xv->entry != entry_WORD) {                       /* op x y -> x (B y op) */
         stg_push(stg, pap2(stg, entry_B2, y, stg->prim_op[op]));
         return stg_tail(stg, x);
     }
     Closure *yv = y;
     while (yv->entry == entry_IND) yv = yv->payload.ind.target;
-    if (yv->entry != entry_WORD) {                       /* y (op x) */
+    if (yv->entry != entry_WORD) {                       /* op x y -> y (op x) */
         stg_push(stg, mk_prim1(stg, op, xv));
         return stg_tail(stg, y);
     }
@@ -974,7 +978,7 @@ typedef struct WorkStack {
 
 static void work_stack_init(WorkStack *ws) {
     ws->cap = 4096;
-    ws->items = malloc(ws->cap * sizeof(WorkItem));
+    ws->items = rmalloc(ws->cap * sizeof(WorkItem));
     ws->sp = 0;
 }
 
@@ -987,7 +991,7 @@ static void work_stack_free(WorkStack *ws) {
 static void work_stack_push(WorkStack *ws, WorkItem item) {
     if (ws->sp >= ws->cap) {
         ws->cap *= 2;
-        ws->items = realloc(ws->items, ws->cap * sizeof(WorkItem));
+        ws->items = rrealloc(ws->items, ws->cap * sizeof(WorkItem));
         if (!ws->items) {
             fprintf(stderr, "STG: work stack realloc failed\n");
             exit(1);
@@ -1132,7 +1136,7 @@ typedef struct ConvStack {
 
 static void conv_stack_init(ConvStack *cs) {
     cs->cap = 4096;
-    cs->items = malloc(cs->cap * sizeof(ConvItem));
+    cs->items = rmalloc(cs->cap * sizeof(ConvItem));
     cs->sp = 0;
 }
 
@@ -1145,7 +1149,7 @@ static void conv_stack_free(ConvStack *cs) {
 static void conv_stack_push(ConvStack *cs, ConvItem item) {
     if (cs->sp >= cs->cap) {
         cs->cap *= 2;
-        cs->items = realloc(cs->items, cs->cap * sizeof(ConvItem));
+        cs->items = rrealloc(cs->items, cs->cap * sizeof(ConvItem));
         if (!cs->items) {
             fprintf(stderr, "STG: conv stack realloc failed\n");
             exit(1);
@@ -1267,7 +1271,7 @@ typedef struct {
 
 static void back_stack_init(BackStack *bs) {
     bs->cap = 4096;
-    bs->items = malloc(bs->cap * sizeof(BackItem));
+    bs->items = rmalloc(bs->cap * sizeof(BackItem));
     bs->sp = 0;
 }
 
@@ -1280,7 +1284,7 @@ static void back_stack_free(BackStack *bs) {
 static void back_stack_push(BackStack *bs, BackItem item) {
     if (bs->sp >= bs->cap) {
         bs->cap *= 2;
-        bs->items = realloc(bs->items, bs->cap * sizeof(BackItem));
+        bs->items = rrealloc(bs->items, bs->cap * sizeof(BackItem));
         if (!bs->items) {
             fprintf(stderr, "STG: back stack realloc failed\n");
             exit(1);
@@ -1545,22 +1549,22 @@ static void stg_gc(STG *stg) {
 static void stg_init(void) {
     if (g_stg) return;
     
-    g_stg = malloc(sizeof(STG));
+    g_stg = rmalloc(sizeof(STG));
     memset(g_stg, 0, sizeof(STG));
     
     g_stg->heap_size = HEAP_SIZE;
-    g_stg->space[0] = malloc(HEAP_SIZE);
-    g_stg->space[1] = malloc(HEAP_SIZE);
+    g_stg->space[0] = rmalloc(HEAP_SIZE);
+    g_stg->space[1] = rmalloc(HEAP_SIZE);
     g_stg->active_space = 0;
     g_stg->hp = g_stg->space[0];
     g_stg->heap_end = (Closure*)((char*)g_stg->space[0] + HEAP_SIZE);
     
-    g_stg->stack = malloc(STACK_SIZE);
+    g_stg->stack = rmalloc(STACK_SIZE);
     g_stg->stack_base = (Closure**)((char*)g_stg->stack + STACK_SIZE);
     g_stg->sp = g_stg->stack_base;
     
     g_stg->update_size = 1024;
-    g_stg->update_stack = malloc(g_stg->update_size * sizeof(g_stg->update_stack[0]));
+    g_stg->update_stack = rmalloc(g_stg->update_size * sizeof(g_stg->update_stack[0]));
     g_stg->update_sp = 0;
     
     /* Pre-build the singletons */

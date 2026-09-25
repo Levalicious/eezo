@@ -1,3 +1,4 @@
+#include <libeezo/res.h>
 /*
  * io.c - Lazy-K / WHNF stream I/O: stdin reading, the input stream as a
  * term, and the driver for the simple interpreter. See io.h.
@@ -10,13 +11,13 @@
 
 u8 *io_read_all_stdin(size_t *len) {
     size_t cap = 65536, n = 0;
-    u8 *buf = malloc(cap);
-    if (!buf) { fprintf(stderr, "io: out of memory\n"); exit(1); }
+    u8 *buf = rmalloc(cap);
+    if (!buf) resource_die("io: out of memory");
     for (;;) {
         if (n == cap) {
             cap *= 2;
-            buf = realloc(buf, cap);
-            if (!buf) { fprintf(stderr, "io: out of memory\n"); exit(1); }
+            buf = rrealloc(buf, cap);
+            if (!buf) resource_die("io: out of memory");
         }
         ssize_t r = read(0, buf + n, cap - n);
         if (r < 0) { perror("io: read"); exit(1); }
