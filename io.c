@@ -112,3 +112,73 @@ int io_run_simple(SKIPool *p, SKITerm *prog, const u8 *data, size_t len) {
         o = next;
     }
 }
+
+/* ------------------------------------------------------------------------
+ * The monadic driver (io.h; stdlib io.eezo)
+ * ------------------------------------------------------------------------ */
+
+/* the value of the Church numeral t (t K S = K^n S), or -1; takes ownership of t */
+static long numeral(SKIPool *p, SKITerm *t) {
+    t = whnf(p, app(p, app(p, t, ski_k(p)), ski_s(p)));
+    long n = 0;
+    while (t->tag == TERM_APP && t->app.left->tag == TERM_K) {
+        n++;
+        SKITerm *u = ski_ref(t->app.right);
+        ski_unref(p, t);
+        t = whnf(p, u);
+    }
+    int ok = t->tag == TERM_S;
+    ski_unref(p, t);
+    return ok ? n : -1;
+}
+
+int io_run_monad_simple(SKIPool *p, SKITerm *prog) {
+    /* the selectors of a 4-tuple, \a b c d -> a .. d, and the numerals 0..256 (one shared chain) */
+    SKITerm *kk = app(p, ski_k(p), ski_k(p));                                                      /* K K */
+    SKITerm *sel0 = app(p, app(p, ski_s(p), ski_ref(kk)), app(p, app(p, ski_s(p), ski_ref(kk)), ski_k(p)));   /* S (K K) (S (K K) K) */
+    SKITerm *sel1 = app(p, ski_k(p), app(p, app(p, ski_s(p), ski_ref(kk)), ski_k(p)));           /* K (S (K K) K) */
+    SKITerm *sel2 = app(p, ski_k(p), ski_ref(kk));                                                /* K (K K) */
+    SKITerm *sel3 = app(p, ski_k(p), app(p, ski_k(p), app(p, ski_k(p), ski_i(p))));              /* K (K (K I)) */
+    ski_unref(p, kk);
+    SKITerm *succ = app(p, ski_s(p), app(p, app(p, ski_s(p), app(p, ski_k(p), ski_s(p))), ski_k(p)));
+    SKITerm *num[257];
+    num[0] = app(p, ski_k(p), ski_i(p));
+    for (int k = 1; k <= 256; k++) num[k] = app(p, ski_ref(succ), ski_ref(num[k - 1]));
+    ski_unref(p, succ);
+    SKITerm *t = prog;
+    int rc = 0;
+    for (;;) {
+        t = whnf(p, t);
+        long tag = numeral(p, app(p, ski_ref(t), ski_ref(sel0)));
+        if (tag == 0) { ski_unref(p, t); break; }                                                 /* done: the result is not observed */
+        if (tag != 1) { io_flush(); fprintf(stderr, "io: the program is not a 4-tuple of the monad's protocol\n"); rc = 1; ski_unref(p, t); break; }
+        SKITerm *k = app(p, ski_ref(t), ski_ref(sel1));
+        SKITerm *g = app(p, ski_ref(t), ski_ref(sel2));
+        SKITerm *x = app(p, ski_ref(t), ski_ref(sel3));
+        ski_unref(p, t);
+        long code = numeral(p, app(p, app(p, app(p, g, ski_ref(num[0])), ski_ref(num[1])), ski_ref(num[2])));
+        if (code == 0) {                                                                           /* putc */
+            long b = numeral(p, x);
+            if (b < 0 || b > 255) { io_flush(); fprintf(stderr, "io: putc of a value that is not a byte\n"); rc = 1; ski_unref(p, k); break; }
+            io_put_byte((int)b);
+            t = app(p, k, ski_ref(num[0]));
+        } else if (code == 1) {                                                                    /* getc */
+            ski_unref(p, x);
+            io_flush();
+            int c = getchar();
+            t = app(p, k, ski_ref(num[c == EOF ? 256 : c]));
+        } else if (code == 2) {                                                                    /* exit */
+            long n = numeral(p, x);
+            ski_unref(p, k);
+            rc = n < 0 ? 1 : (int)n;
+            break;
+        } else {
+            io_flush(); fprintf(stderr, "io: the action is not one the driver has (%ld)\n", code); rc = 1;
+            ski_unref(p, k); ski_unref(p, x); break;
+        }
+    }
+    io_flush();
+    for (int k = 0; k <= 256; k++) ski_unref(p, num[k]);
+    ski_unref(p, sel0); ski_unref(p, sel1); ski_unref(p, sel2); ski_unref(p, sel3);
+    return rc;
+}

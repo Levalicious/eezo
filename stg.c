@@ -1743,3 +1743,112 @@ int stg_run_io(SKIPool *pool, SKITerm *prog, const u8 *data, size_t len) {
         o = io_ap(stg, v, kI);                                  /* tail = v (K I) */
     }
 }
+
+/* ========================================================================
+ * The monadic driver (eezo -m; see io.h and the stdlib's io.eezo)
+ * ======================================================================== */
+
+/* a Church numeral n = succ^n (K I); the caller reserved MO_NUMERAL_WORDS(n) */
+#define MO_NUMERAL_WORDS(n) (2 + 12 + 3 * (n))
+static Closure *mo_ki(STG *stg) {
+    Closure *ki = stg_alloc(stg, 2);
+    ki->entry = entry_K1;
+    ki->payload.k1.x = stg->prim_I;
+    return ki;
+}
+static Closure *mo_succ(STG *stg) {   /* S (S (K S) K): 12 words */
+    return io_ap(stg, stg->prim_S, io_ap(stg, io_ap(stg, stg->prim_S, io_ap(stg, stg->prim_K, stg->prim_S)), stg->prim_K));
+}
+static Closure *mo_numeral(STG *stg, long n) {
+    Closure *c = mo_ki(stg);
+    if (n == 0) return c;
+    Closure *succ = mo_succ(stg);
+    for (long k = 0; k < n; k++) c = io_ap(stg, succ, c);
+    return c;
+}
+/* the value of the Church numeral h (h K S = K^n S), or -1 when it is not one; uses extra_roots[3] */
+static long mo_value(STG *stg, Closure *h) {
+    stg->extra_roots[3] = h;
+    stg_reserve(stg, 6);
+    h = stg->extra_roots[3];
+    stg->extra_roots[3] = NULL;
+    Closure *t = stg_enter(stg, io_ap(stg, io_ap(stg, h, stg->prim_K), stg->prim_S));
+    long n = 0;
+    while (t->entry == entry_K1) {
+        n++;
+        t = stg_enter(stg, t->payload.k1.x);
+    }
+    return t->entry == entry_S ? n : -1;
+}
+
+int stg_run_monad(SKIPool *pool, SKITerm *prog) {
+    (void)pool;
+    stg_init();
+    stg_reset();
+    STG *stg = g_stg;
+    if (setjmp(stg->exit_jmp)) {
+        io_flush();
+        return 1;
+    }
+    Closure *t = term_to_stg(stg, prog);
+    for (;;) {
+        Closure *v = stg_enter(stg, t);                          /* the 4-tuple f -> f tag k g x, in WHNF */
+        /* the selectors \a b c d -> a .. d, built beside v: K K, S (K K), S (K K) K, and the four (39 words) */
+        stg->extra_roots[0] = v;
+        stg_reserve(stg, 39 + 3);
+        v = stg->extra_roots[0];
+        Closure *kk = io_ap(stg, stg->prim_K, stg->prim_K);
+        Closure *skk = io_ap(stg, stg->prim_S, kk);
+        Closure *skkk = io_ap(stg, skk, stg->prim_K);
+        Closure *sel0 = io_ap(stg, skk, skkk);                   /* S (K K) (S (K K) K) */
+        long tag = mo_value(stg, io_ap(stg, v, sel0));
+        if (tag == 0) break;                                     /* done: the result is not observed */
+        if (tag != 1) { io_flush(); fprintf(stderr, "io: the program is not a 4-tuple of the monad's protocol\n"); return 1; }
+        v = stg->extra_roots[0];
+        stg_reserve(stg, 39 + 9);
+        v = stg->extra_roots[0];
+        stg->extra_roots[0] = NULL;
+        kk = io_ap(stg, stg->prim_K, stg->prim_K);
+        skk = io_ap(stg, stg->prim_S, kk);
+        skkk = io_ap(stg, skk, stg->prim_K);
+        Closure *sel1 = io_ap(stg, stg->prim_K, skkk);           /* K (S (K K) K) */
+        Closure *sel2 = io_ap(stg, stg->prim_K, kk);             /* K (K K) */
+        Closure *sel3 = io_ap(stg, stg->prim_K, io_ap(stg, stg->prim_K, mo_ki(stg)));   /* K (K (K I)) */
+        Closure *k = io_ap(stg, v, sel1);
+        Closure *g = io_ap(stg, v, sel2);
+        Closure *x = io_ap(stg, v, sel3);
+        stg->extra_roots[0] = k; stg->extra_roots[1] = x; stg->extra_roots[2] = g;
+        stg_reserve(stg, 2 + 12 + 6 + 9);
+        k = stg->extra_roots[0]; x = stg->extra_roots[1]; g = stg->extra_roots[2];
+        stg->extra_roots[2] = NULL;
+        Closure *n0 = mo_ki(stg), *succ = mo_succ(stg);
+        Closure *n1 = io_ap(stg, succ, n0), *n2 = io_ap(stg, succ, n1);
+        long code = mo_value(stg, io_ap(stg, io_ap(stg, io_ap(stg, g, n0), n1), n2));   /* which handler the action selects */
+        k = stg->extra_roots[0]; x = stg->extra_roots[1];
+        if (code == 0) {                                         /* putc */
+            long b = mo_value(stg, x);
+            if (b < 0 || b > 255) { io_flush(); fprintf(stderr, "io: putc of a value that is not a byte\n"); return 1; }
+            io_put_byte((int)b);
+            stg_reserve(stg, 2 + 3);
+            k = stg->extra_roots[0];
+            stg->extra_roots[0] = stg->extra_roots[1] = NULL;
+            t = io_ap(stg, k, mo_ki(stg));
+        } else if (code == 1) {                                  /* getc */
+            io_flush();
+            int c = getchar();
+            long b = c == EOF ? 256 : c;
+            stg_reserve(stg, MO_NUMERAL_WORDS(b) + 3);
+            k = stg->extra_roots[0];
+            stg->extra_roots[0] = stg->extra_roots[1] = NULL;
+            t = io_ap(stg, k, mo_numeral(stg, b));
+        } else if (code == 2) {                                  /* exit */
+            long n = mo_value(stg, x);
+            io_flush();
+            return n < 0 ? 1 : (int)n;
+        } else {
+            io_flush(); fprintf(stderr, "io: the action is not one the driver has (%ld)\n", code); return 1;
+        }
+    }
+    io_flush();
+    return 0;
+}

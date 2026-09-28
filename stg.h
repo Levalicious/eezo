@@ -17,5 +17,6 @@ SKITerm *stg_reduce(SKIPool *pool, SKITerm *term, i64 *steps, int whnf);
  * become the input stream, output bytes go to stdout as they are
  * produced. Returns the process exit status. */
 int stg_run_io(SKIPool *pool, SKITerm *prog, const u8 *data, size_t len);
+int stg_run_monad(SKIPool *pool, SKITerm *prog);   /* the monadic driver (eezo -m; io.h) */
 
 #endif /* EEZO_STG_H */

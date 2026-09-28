@@ -34,6 +34,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -n            Use native JIT (x86_64)\n");
     fprintf(stderr, "  -i            Stream I/O mode (Lazy-K): the program, given as a FILE argument,\n");
     fprintf(stderr, "                maps the byte stream on stdin to the byte stream on stdout\n");
+    fprintf(stderr, "  -m            Monadic I/O mode: the program is run(m) of the stdlib's io.eezo, a value of\n");
+    fprintf(stderr, "                the IO monad; the driver performs its actions (putc, getc, exit)\n");
     fprintf(stderr, "  -H BYTES      (with -n) initial semispace size, default 16MiB; grows on demand\n");
     fprintf(stderr, "  -N MODE       Normalization: nf (default, full normal form) or whnf\n");
     fprintf(stderr, "                (weak head normal form: head reduction only)\n");
@@ -156,6 +158,7 @@ int main(int argc, char **argv) {
     Format fmt = FMT_BCL;
     int use_simple = 0;
     int io_mode = 0;
+    int monad_mode = 0;
     const char *prog_path = NULL;
     int use_native = 0;
     int verbose = 0;
@@ -173,6 +176,8 @@ int main(int argc, char **argv) {
             use_simple = 1;
         } else if (strcmp(argv[i], "-i") == 0) {
             io_mode = 1;
+        } else if (strcmp(argv[i], "-m") == 0) {
+            monad_mode = 1;
         } else if (strcmp(argv[i], "-n") == 0) {
             use_native = 1;
         } else if (strcmp(argv[i], "-H") == 0) {
@@ -289,6 +294,28 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Input: ");
         ski_fprint(stderr, term);
         fprintf(stderr, "\n");
+    }
+
+    /* Monadic I/O mode: the program is run(m), a value of the IO monad; the driver performs its actions (io.h) */
+    if (monad_mode) {
+        int rc;
+        if (use_native) {
+            u32 code_cap = 64 * 1024;
+            u8 *code_buf = rmalloc(code_cap);
+            NativeEmit e;
+            native_emit_init(&e, code_buf, code_cap, OUTPUT_BCL);
+            e.io_mode = 2;
+            native_emit_runtime(&e);
+            NativeJIT *jit = native_jit_prepare(&e, heap_size);
+            if (!jit || native_jit_load_term(jit, term) != 0) { fprintf(stderr, "JIT preparation failed\n"); rc = 1; }
+            else rc = native_jit_run(jit);            /* the child performs the actions itself */
+            native_jit_free(jit);
+            free(code_buf);
+        }
+        else if (use_simple) rc = io_run_monad_simple(&pool, term);
+        else rc = stg_run_monad(&pool, term);
+        pool_free(&pool);
+        return rc;
     }
 
     /* Stream I/O mode: the program is a function from the input stream to
