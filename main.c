@@ -5,6 +5,7 @@
  * Evaluates pre-compiled BCL/Jot/Jomplement programs.
  * Like java vs javac - this is the runtime.
  */
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -148,6 +149,10 @@ static void output_result(SKITerm *term, Format fmt) {
 }
 
 int main(int argc, char **argv) {
+    /* The classic pipe behaviour whatever the parent left us: a program streaming to a reader that has gone away dies
+       of SIGPIPE (exit 141). A CI runner's shell ignores SIGPIPE, and an inherited SIG_IGN turned the death into an
+       endless loop of failed writes (the io suite's 'ones', 2026-09-28). */
+    signal(SIGPIPE, SIG_DFL);
     Format fmt = FMT_BCL;
     int use_simple = 0;
     int io_mode = 0;
