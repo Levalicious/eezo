@@ -9,8 +9,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: eezo            # this repository beside its dependencies: the workspace layout the mkfiles assume (../libeezo, ...)
-      - uses: Levalicious/mk@2e9df12fdc3a4d9a2793cb2d6d641817bd83cbbc
-      - uses: Levalicious/mkroot@38fc598680d6b47b13e4ac2b1f2d303023ba30d5
+      - uses: Levalicious/mk@477dc780cdfe992debfb0c07a4d9893deb5aa8db
+      - uses: Levalicious/mkroot@36d0977adb014e0e2775222d23ce522ddde8b570
       - name: dependencies at the commits deps.lock pins
         run: sh eezo/ci/deps.sh
       - name: build, dependencies first

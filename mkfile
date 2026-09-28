@@ -13,9 +13,13 @@ HFILES=\
 	../libeezo/native.h\
 	../libeezo/term.h\
 
-LIBS=../libeezo
+CFLAGS=-Wall -O2 -I..
+LIBEEZO=../libeezo/libeezo.a
+LIBFILES=$LIBEEZO
 
 <$MKROOT/proto/mkone
 
-# relink when the library changes (mkone LIBS= links it but does not depend on it)
-$PROG: ../libeezo/libeezo.a
+# the library, a real prerequisite of the program: built in its directory when its sources change (mkone LIBFILES)
+$LIBEEZO: `ls ../libeezo/*.[ch]`
+	cd ../libeezo && mk libeezo.a
+
