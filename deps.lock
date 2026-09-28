@@ -1,2 +1,2 @@
 # repositories this one depends on, at the commits its CI fetches as siblings (ci/deps.sh)
-libeezo 38f750101db1c715587d0db4c1301300819d5d64
+libeezo fe4d1f636f6d33cf81d14332c3af572e17a8c189
