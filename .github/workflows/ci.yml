@@ -1,0 +1,18 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: eezo            # this repository beside its dependencies: the workspace layout the mkfiles assume (../libeezo, ...)
+      - uses: Levalicious/mk@2e9df12fdc3a4d9a2793cb2d6d641817bd83cbbc
+      - uses: Levalicious/mkroot@38fc598680d6b47b13e4ac2b1f2d303023ba30d5
+      - name: dependencies at the commits deps.lock pins
+        run: sh eezo/ci/deps.sh
+      - name: build, dependencies first
+        run: for d in libeezo eezo; do (cd $d && mk) || exit 1; done
+
