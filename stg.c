@@ -1792,37 +1792,38 @@ int stg_run_monad(SKIPool *pool, SKITerm *prog) {
     }
     Closure *t = term_to_stg(stg, prog);
     for (;;) {
-        Closure *v = stg_enter(stg, t);                          /* the 4-tuple f -> f tag k g x, in WHNF */
-        /* the selectors \a b c d -> a .. d, built beside v: K K, S (K K), S (K K) K, and the four (39 words) */
+        Closure *v = stg_enter(stg, t);                          /* the step e -> a -> e | e -> a -> a g k x, in WHNF */
+        /* the tag: v 0 (K (K (K 1))); built beside v: 0 (2), 1 (2 + 12 + 3), the selector (9), the applications (6) */
         stg->extra_roots[0] = v;
-        stg_reserve(stg, 39 + 3);
+        stg_reserve(stg, 34);
         v = stg->extra_roots[0];
-        Closure *kk = io_ap(stg, stg->prim_K, stg->prim_K);
-        Closure *skk = io_ap(stg, stg->prim_S, kk);
-        Closure *skkk = io_ap(stg, skk, stg->prim_K);
-        Closure *sel0 = io_ap(stg, skk, skkk);                   /* S (K K) (S (K K) K) */
-        long tag = mo_value(stg, io_ap(stg, v, sel0));
+        Closure *n0 = mo_ki(stg);
+        Closure *n1 = io_ap(stg, mo_succ(stg), mo_ki(stg));
+        Closure *sel0 = io_ap(stg, stg->prim_K, io_ap(stg, stg->prim_K, io_ap(stg, stg->prim_K, n1)));
+        long tag = mo_value(stg, io_ap(stg, io_ap(stg, v, n0), sel0));
         if (tag == 0) break;                                     /* done: the result is not observed */
-        if (tag != 1) { io_flush(); fprintf(stderr, "io: the program is not a 4-tuple of the monad's protocol\n"); return 1; }
+        if (tag != 1) { io_flush(); fprintf(stderr, "io: the program is not a step of the monad's protocol\n"); return 1; }
+        /* the fields: v 0 (\g k x -> g), v 0 (\g k x -> k), v 0 (\g k x -> x): 2 + 9 + 3 + 5 + 3 * 6 = 37 words */
         v = stg->extra_roots[0];
-        stg_reserve(stg, 39 + 9);
+        stg_reserve(stg, 37);
         v = stg->extra_roots[0];
         stg->extra_roots[0] = NULL;
-        kk = io_ap(stg, stg->prim_K, stg->prim_K);
-        skk = io_ap(stg, stg->prim_S, kk);
-        skkk = io_ap(stg, skk, stg->prim_K);
-        Closure *sel1 = io_ap(stg, stg->prim_K, skkk);           /* K (S (K K) K) */
-        Closure *sel2 = io_ap(stg, stg->prim_K, kk);             /* K (K K) */
-        Closure *sel3 = io_ap(stg, stg->prim_K, io_ap(stg, stg->prim_K, mo_ki(stg)));   /* K (K (K I)) */
-        Closure *k = io_ap(stg, v, sel1);
-        Closure *g = io_ap(stg, v, sel2);
-        Closure *x = io_ap(stg, v, sel3);
+        n0 = mo_ki(stg);
+        Closure *kk = io_ap(stg, stg->prim_K, stg->prim_K);
+        Closure *sel1 = io_ap(stg, io_ap(stg, stg->prim_S, kk), stg->prim_K);   /* S (K K) K */
+        Closure *sel2 = kk;                                                     /* K K */
+        Closure *sel3 = io_ap(stg, stg->prim_K, mo_ki(stg));                    /* K (K I) */
+        Closure *g = io_ap(stg, io_ap(stg, v, n0), sel1);
+        Closure *k = io_ap(stg, io_ap(stg, v, n0), sel2);
+        Closure *x = io_ap(stg, io_ap(stg, v, n0), sel3);
         stg->extra_roots[0] = k; stg->extra_roots[1] = x; stg->extra_roots[2] = g;
         stg_reserve(stg, 2 + 12 + 6 + 9);
         k = stg->extra_roots[0]; x = stg->extra_roots[1]; g = stg->extra_roots[2];
         stg->extra_roots[2] = NULL;
-        Closure *n0 = mo_ki(stg), *succ = mo_succ(stg);
-        Closure *n1 = io_ap(stg, succ, n0), *n2 = io_ap(stg, succ, n1);
+        n0 = mo_ki(stg);
+        Closure *succ = mo_succ(stg);
+        n1 = io_ap(stg, succ, n0);
+        Closure *n2 = io_ap(stg, succ, n1);
         long code = mo_value(stg, io_ap(stg, io_ap(stg, io_ap(stg, g, n0), n1), n2));   /* which handler the action selects */
         k = stg->extra_roots[0]; x = stg->extra_roots[1];
         if (code == 0) {                                         /* putc */

@@ -31,9 +31,9 @@ SKITerm *io_input_term(SKIPool *p, const u8 *data, size_t len);
  * Returns the process exit status. */
 int io_run_simple(SKIPool *p, SKITerm *prog, const u8 *data, size_t len);
 
-/* The monadic driver (eezo -m; stdlib io.eezo): the program is run(m), a 4-tuple f -> f(tag)(k)(g)(x) once in weak
-   head normal form; tag 0 ends with the result, tag 1 asks for the action g (a selector over putc, getc, exit) on
-   the input x and continues with k applied to the result. Reads stdin a byte at a time (256 at its end). */
+/* The monadic driver (eezo -m; stdlib io.eezo): the program is run(m), once in weak head normal form a Scott-encoded
+   step e -> a -> e (done) or e -> a -> a g k x (an action g, a selector over putc, getc, exit, on the input x; the
+   driver continues with k applied to the result). Reads stdin a byte at a time (256 at its end). */
 int io_run_monad_simple(SKIPool *p, SKITerm *prog);
 
 #endif

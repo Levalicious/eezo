@@ -133,28 +133,28 @@ static long numeral(SKIPool *p, SKITerm *t) {
 }
 
 int io_run_monad_simple(SKIPool *p, SKITerm *prog) {
-    /* the selectors of a 4-tuple, \a b c d -> a .. d, and the numerals 0..256 (one shared chain) */
-    SKITerm *kk = app(p, ski_k(p), ski_k(p));                                                      /* K K */
-    SKITerm *sel0 = app(p, app(p, ski_s(p), ski_ref(kk)), app(p, app(p, ski_s(p), ski_ref(kk)), ski_k(p)));   /* S (K K) (S (K K) K) */
-    SKITerm *sel1 = app(p, ski_k(p), app(p, app(p, ski_s(p), ski_ref(kk)), ski_k(p)));           /* K (S (K K) K) */
-    SKITerm *sel2 = app(p, ski_k(p), ski_ref(kk));                                                /* K (K K) */
-    SKITerm *sel3 = app(p, ski_k(p), app(p, ski_k(p), app(p, ski_k(p), ski_i(p))));              /* K (K (K I)) */
-    ski_unref(p, kk);
+    /* the numerals 0..256 (one shared chain); the step's readers: a step is e -> a -> e (done) or
+       e -> a -> a g k x (act), so step 0 (\g k x -> 1) is the tag and step 0 (\g k x -> g) .. the fields */
     SKITerm *succ = app(p, ski_s(p), app(p, app(p, ski_s(p), app(p, ski_k(p), ski_s(p))), ski_k(p)));
     SKITerm *num[257];
     num[0] = app(p, ski_k(p), ski_i(p));
     for (int k = 1; k <= 256; k++) num[k] = app(p, ski_ref(succ), ski_ref(num[k - 1]));
     ski_unref(p, succ);
+    SKITerm *kk = app(p, ski_k(p), ski_k(p));                                                      /* K K */
+    SKITerm *sel0 = app(p, ski_k(p), app(p, ski_k(p), app(p, ski_k(p), ski_ref(num[1]))));       /* K (K (K 1)): the tag */
+    SKITerm *sel1 = app(p, app(p, ski_s(p), ski_ref(kk)), ski_k(p));                              /* S (K K) K = \g k x -> g */
+    SKITerm *sel2 = kk;                                                                           /* K K = \g k x -> k */
+    SKITerm *sel3 = app(p, ski_k(p), app(p, ski_k(p), ski_i(p)));                                 /* K (K I) = \g k x -> x */
     SKITerm *t = prog;
     int rc = 0;
     for (;;) {
         t = whnf(p, t);
-        long tag = numeral(p, app(p, ski_ref(t), ski_ref(sel0)));
+        long tag = numeral(p, app(p, app(p, ski_ref(t), ski_ref(num[0])), ski_ref(sel0)));
         if (tag == 0) { ski_unref(p, t); break; }                                                 /* done: the result is not observed */
-        if (tag != 1) { io_flush(); fprintf(stderr, "io: the program is not a 4-tuple of the monad's protocol\n"); rc = 1; ski_unref(p, t); break; }
-        SKITerm *k = app(p, ski_ref(t), ski_ref(sel1));
-        SKITerm *g = app(p, ski_ref(t), ski_ref(sel2));
-        SKITerm *x = app(p, ski_ref(t), ski_ref(sel3));
+        if (tag != 1) { io_flush(); fprintf(stderr, "io: the program is not a step of the monad's protocol\n"); rc = 1; ski_unref(p, t); break; }
+        SKITerm *g = app(p, app(p, ski_ref(t), ski_ref(num[0])), ski_ref(sel1));
+        SKITerm *k = app(p, app(p, ski_ref(t), ski_ref(num[0])), ski_ref(sel2));
+        SKITerm *x = app(p, app(p, ski_ref(t), ski_ref(num[0])), ski_ref(sel3));
         ski_unref(p, t);
         long code = numeral(p, app(p, app(p, app(p, g, ski_ref(num[0])), ski_ref(num[1])), ski_ref(num[2])));
         if (code == 0) {                                                                           /* putc */
