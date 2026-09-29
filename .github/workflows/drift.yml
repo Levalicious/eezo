@@ -1,0 +1,31 @@
+name: drift
+# Twice a month: the pins this repository holds (deps.lock, the uses: lines, submodules) against upstream main.
+# It reports in one issue labelled drift - updated while the drift lasts, closed when it is gone - and changes nothing:
+# bumping a pin is an ordinary commit, whose CI then tests the new set.
+on:
+  schedule:
+    - cron: '17 6 1,15 * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: pins against upstream heads
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          report=$(bash ci/drift.sh)
+          num=$(gh issue list --state open --label drift --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          if [ -z "$report" ]; then
+            echo "every pin is current"
+            if [ -n "$num" ]; then gh issue close "$num" --comment "Every pin is current as of $(date -u +%F)."; fi
+            exit 0
+          fi
+          echo "$report"
+          body=$(printf 'Pins this repository holds that upstream main has moved past in substance, as of %s. Bumping is an ordinary commit (deps.lock, the uses: lines of the workflows, or the submodule); this issue only reports.\n\n%s\n' "$(date -u +%F)" "$report")
+          gh label create drift --color BFD4F2 --description "pins behind upstream" 2>/dev/null || true
+          if [ -n "$num" ]; then gh issue edit "$num" --body "$body"; else gh issue create --title "Pins behind upstream" --label drift --body "$body"; fi
