@@ -1,4 +1,4 @@
-#include <libeezo/res.h>
+#include <libeezo/mem.h>
 /*
  * io.c - Lazy-K / WHNF stream I/O: stdin reading, the input stream as a
  * term, and the driver for the simple interpreter. See io.h.
@@ -12,12 +12,10 @@
 u8 *io_read_all_stdin(size_t *len) {
     size_t cap = 65536, n = 0;
     u8 *buf = rmalloc(cap);
-    if (!buf) resource_die("io: out of memory");
     for (;;) {
         if (n == cap) {
             cap *= 2;
             buf = rrealloc(buf, cap);
-            if (!buf) resource_die("io: out of memory");
         }
         ssize_t r = read(0, buf + n, cap - n);
         if (r < 0) { perror("io: read"); exit(1); }
@@ -36,11 +34,7 @@ void io_flush(void) {
     fflush(stdout);
 }
 
-static SKITerm *app(SKIPool *p, SKITerm *l, SKITerm *r) {
-    SKITerm *t = ski_app(p, l, r);
-    if (!t) { fprintf(stderr, "io: term pool exhausted\n"); exit(1); }
-    return t;
-}
+static SKITerm *app(SKIPool *p, SKITerm *l, SKITerm *r) { return ski_app(p, l, r); }
 
 /* cons x y = S (S I (K x)) (K y)  - the pair  f -> f x y.
  * Takes ownership of one reference to x and to y. */
@@ -77,7 +71,7 @@ SKITerm *io_input_term(SKIPool *p, const u8 *data, size_t len) {
 static SKITerm *whnf(SKIPool *p, SKITerm *t) {
     if (ski_reduce_mode(p, &t, 0, true) < 0) {
         io_flush();
-        fprintf(stderr, "io: reduction failed (term pool exhausted?)\n");
+        fprintf(stderr, "io: reduction failed (an unknown primitive)\n");
         exit(1);
     }
     return t;
