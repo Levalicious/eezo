@@ -1,4 +1,4 @@
-#include <libeezo/res.h>
+#include <libeezo/mem.h>
 /*
  * stg.c - STG Machine for SKI Combinators
  *
@@ -30,8 +30,10 @@
 #include <string.h>
 #include <setjmp.h>
 
-#define HEAP_SIZE   (16 * 1024 * 1024)  /* 16MB per semi-space */
-#define STACK_SIZE  (256 * 1024)
+/* The machine's first sizes, not its limits: the semi-spaces grow after a collection that leaves them more than half
+   full, the argument stack grows when it fills, and the only limit is the memory layer's (mem.h) */
+#define HEAP_SIZE   (16 * 1024 * 1024)  /* each semi-space, at start */
+#define STACK_SIZE  (256 * 1024)        /* the argument stack, at start */
 #define WORD        sizeof(void*)
 
 /* Forward declarations */
@@ -73,7 +75,8 @@ typedef struct STG {
     int active_space;     /* which space is currently active (0 or 1) */
     Closure *hp;          /* heap allocation pointer */
     Closure *heap_end;    /* end of current semi-space */
-    size_t heap_size;     /* size of each semi-space */
+    size_t heap_size;     /* size of each semi-space (they grow together: stg_make_room) */
+    Closure *gc_to;       /* during a collection: the space it copies into */
     
     Closure **stack;      /* argument stack */
     Closure **sp;         /* stack pointer (grows down) */
@@ -226,24 +229,15 @@ static int closure_size(Closure *c) {
 /*
  * Allocate on heap - triggers GC if needed
  */
+static void stg_make_room(STG *stg, size_t need_bytes);
 static Closure *stg_alloc(STG *stg, int words) {
-    Closure *p = stg->hp;
     Closure *new_hp = (Closure*)((char*)stg->hp + words * WORD);
-    
     if ((char*)new_hp >= (char*)stg->heap_end) {
-        /* Trigger garbage collection */
-        stg_gc(stg);
-        
-        /* Try again after GC */
-        p = stg->hp;
+        stg_gc(stg);                                  /* collect, then grow if the space is still too full */
+        stg_make_room(stg, (size_t)words * WORD);
         new_hp = (Closure*)((char*)stg->hp + words * WORD);
-        
-        if ((char*)new_hp >= (char*)stg->heap_end) {
-            resource_die("STG: heap overflow after GC (need %d words)", words);
-            longjmp(stg->exit_jmp, 1);
-        }
     }
-    
+    Closure *p = stg->hp;
     stg->hp = new_hp;
     return p;
 }
@@ -255,26 +249,29 @@ static Closure *stg_alloc(STG *stg, int words) {
  * the collection this may trigger. Subsequent stg_alloc calls totalling
  * `words` are then GC-free.
  */
-static void stg_reserve(STG *stg, int words) {
-    Closure *new_hp = (Closure*)((char*)stg->hp + words * WORD);
-    if ((char*)new_hp >= (char*)stg->heap_end) {
+static void stg_reserve(STG *stg, size_t words) {
+    if ((size_t)((char*)stg->heap_end - (char*)stg->hp) <= words * WORD) {
         stg_gc(stg);
-        new_hp = (Closure*)((char*)stg->hp + words * WORD);
-        if ((char*)new_hp >= (char*)stg->heap_end) {
-            resource_die("STG: heap overflow after GC (need %d words)", words);
-            longjmp(stg->exit_jmp, 1);
-        }
+        stg_make_room(stg, words * WORD);
     }
 }
 
 /*
  * Push to argument stack
  */
+/* the argument stack full: twice the room, the contents moved to the new top (it grows down), and every pointer into
+   it - sp, the update frames' barriers - moved with them (nothing else points into it) */
+static void stg_grow_stack(STG *stg) {
+    size_t used = (size_t)(stg->stack_base - stg->sp), cap = (size_t)(stg->stack_base - stg->stack), nc = cap * 2;
+    Closure **ns = rmalloc(nc * sizeof(Closure*)), **nbase = ns + nc;
+    memcpy(nbase - used, stg->sp, used * sizeof(Closure*));
+    ptrdiff_t delta = nbase - stg->stack_base;
+    for (int i = 0; i < stg->update_sp; i++) stg->update_stack[i].saved_sp += delta;
+    free(stg->stack);
+    stg->stack = ns; stg->stack_base = nbase; stg->sp = nbase - used;
+}
 static void stg_push(STG *stg, Closure *c) {
-    if (stg->sp <= stg->stack) {
-        fprintf(stderr, "STG: stack overflow\n");
-        longjmp(stg->exit_jmp, 1);
-    }
+    if (stg->sp <= stg->stack) stg_grow_stack(stg);
     *--stg->sp = c;
 }
 
@@ -312,10 +309,6 @@ static void stg_push_update(STG *stg, Closure *t) {
         stg->update_size *= 2;
         stg->update_stack = rrealloc(stg->update_stack,
                                     stg->update_size * sizeof(stg->update_stack[0]));
-        if (!stg->update_stack) {
-            fprintf(stderr, "STG: update stack realloc failed\n");
-            exit(1);
-        }
     }
     stg->update_stack[stg->update_sp].thunk = t;
     stg->update_stack[stg->update_sp].saved_sp = stg->sp;
@@ -970,35 +963,10 @@ typedef struct {
     Closure *saved_x;      /* for two-argument PAPs: save normalized x while processing y */
 } WorkItem;
 
-typedef struct WorkStack {
-    WorkItem *items;
-    size_t sp;       /* stack pointer (next free slot) */
-    size_t cap;      /* capacity */
-} WorkStack;
-
-static void work_stack_init(WorkStack *ws) {
-    ws->cap = 4096;
-    ws->items = rmalloc(ws->cap * sizeof(WorkItem));
-    ws->sp = 0;
-}
-
-static void work_stack_free(WorkStack *ws) {
-    free(ws->items);
-    ws->items = NULL;
-    ws->sp = ws->cap = 0;
-}
-
-static void work_stack_push(WorkStack *ws, WorkItem item) {
-    if (ws->sp >= ws->cap) {
-        ws->cap *= 2;
-        ws->items = rrealloc(ws->items, ws->cap * sizeof(WorkItem));
-        if (!ws->items) {
-            fprintf(stderr, "STG: work stack realloc failed\n");
-            exit(1);
-        }
-    }
-    ws->items[ws->sp++] = item;
-}
+typedef struct WorkStack { Stack s; } WorkStack;   /* a Stack of the memory layer (mem.h) */
+static void work_stack_init(WorkStack *ws) { stack_init(&ws->s, sizeof(WorkItem)); }
+static void work_stack_free(WorkStack *ws) { stack_drop(&ws->s); }
+static void work_stack_push(WorkStack *ws, WorkItem item) { STACK_PUSH(&ws->s, WorkItem, item); }
 
 static Closure *stg_normalize(STG *stg, Closure *c) {
     WorkStack ws;
@@ -1016,8 +984,8 @@ static Closure *stg_normalize(STG *stg, Closure *c) {
     };
     
     #define DISPATCH() do { \
-        if (ws.sp == 0) goto done; \
-        item = ws.items[--ws.sp]; \
+        if (ws.s.n == 0) goto done; \
+        item = STACK_POP(&ws.s, WorkItem); \
         goto *dispatch[item.type]; \
     } while (0)
     
@@ -1079,7 +1047,7 @@ do_p1_done: {
 
 do_p2_x_done: {
     Closure *cur = item.closure;
-    ws.items[ws.sp - 1].saved_x = result;
+    STACK_TOP(&ws.s, WorkItem).saved_x = result;
     work_stack_push(&ws, (WorkItem){WORK_NORMALIZE, cur->payload.s2.y, NULL});
     DISPATCH();
 }
@@ -1128,39 +1096,11 @@ typedef struct {
     Closure *left_result;
 } ConvItem;
 
-typedef struct ConvStack {
-    ConvItem *items;
-    size_t sp;
-    size_t cap;
-} ConvStack;
-
-static void conv_stack_init(ConvStack *cs) {
-    cs->cap = 4096;
-    cs->items = rmalloc(cs->cap * sizeof(ConvItem));
-    cs->sp = 0;
-}
-
-static void conv_stack_free(ConvStack *cs) {
-    free(cs->items);
-    cs->items = NULL;
-    cs->sp = cs->cap = 0;
-}
-
-static void conv_stack_push(ConvStack *cs, ConvItem item) {
-    if (cs->sp >= cs->cap) {
-        cs->cap *= 2;
-        cs->items = rrealloc(cs->items, cs->cap * sizeof(ConvItem));
-        if (!cs->items) {
-            fprintf(stderr, "STG: conv stack realloc failed\n");
-            exit(1);
-        }
-    }
-    cs->items[cs->sp++] = item;
-}
-
-static ConvItem conv_stack_pop(ConvStack *cs) {
-    return cs->items[--cs->sp];
-}
+typedef struct ConvStack { Stack s; } ConvStack;   /* a Stack of the memory layer (mem.h) */
+static void conv_stack_init(ConvStack *cs) { stack_init(&cs->s, sizeof(ConvItem)); }
+static void conv_stack_free(ConvStack *cs) { stack_drop(&cs->s); }
+static void conv_stack_push(ConvStack *cs, ConvItem item) { STACK_PUSH(&cs->s, ConvItem, item); }
+static ConvItem conv_stack_pop(ConvStack *cs) { return STACK_POP(&cs->s, ConvItem); }
 
 static Closure *term_to_stg(STG *stg, SKITerm *t) {
     ConvStack cs;
@@ -1171,7 +1111,7 @@ static Closure *term_to_stg(STG *stg, SKITerm *t) {
     
     conv_stack_push(&cs, (ConvItem){CONV_VISIT, t, NULL});
     
-    while (cs.sp > 0) {
+    while (cs.s.n > 0) {
         ConvItem item = conv_stack_pop(&cs);
         
         switch (item.type) {
@@ -1215,7 +1155,7 @@ static Closure *term_to_stg(STG *stg, SKITerm *t) {
             
         case CONV_APP_RIGHT:
             /* left is done (in result), save it and do right */
-            cs.items[cs.sp - 1].left_result = result;
+            STACK_TOP(&cs.s, ConvItem).left_result = result;
             conv_stack_push(&cs, (ConvItem){CONV_VISIT, item.term->app.right, NULL});
             break;
             
@@ -1263,39 +1203,11 @@ typedef struct {
     SKITerm *left_result;
 } BackItem;
 
-typedef struct {
-    BackItem *items;
-    size_t sp;
-    size_t cap;
-} BackStack;
-
-static void back_stack_init(BackStack *bs) {
-    bs->cap = 4096;
-    bs->items = rmalloc(bs->cap * sizeof(BackItem));
-    bs->sp = 0;
-}
-
-static void back_stack_free(BackStack *bs) {
-    free(bs->items);
-    bs->items = NULL;
-    bs->sp = bs->cap = 0;
-}
-
-static void back_stack_push(BackStack *bs, BackItem item) {
-    if (bs->sp >= bs->cap) {
-        bs->cap *= 2;
-        bs->items = rrealloc(bs->items, bs->cap * sizeof(BackItem));
-        if (!bs->items) {
-            fprintf(stderr, "STG: back stack realloc failed\n");
-            exit(1);
-        }
-    }
-    bs->items[bs->sp++] = item;
-}
-
-static BackItem back_stack_pop(BackStack *bs) {
-    return bs->items[--bs->sp];
-}
+typedef struct { Stack s; } BackStack;   /* a Stack of the memory layer (mem.h) */
+static void back_stack_init(BackStack *bs) { stack_init(&bs->s, sizeof(BackItem)); }
+static void back_stack_free(BackStack *bs) { stack_drop(&bs->s); }
+static void back_stack_push(BackStack *bs, BackItem item) { STACK_PUSH(&bs->s, BackItem, item); }
+static BackItem back_stack_pop(BackStack *bs) { return STACK_POP(&bs->s, BackItem); }
 
 /* A leaf closure, or the head of a PAP, as a term */
 static SKITerm *head_term(SKIPool *pool, Closure *c) {
@@ -1322,7 +1234,7 @@ static SKITerm *stg_to_term(SKIPool *pool, Closure *c) {
     
     back_stack_push(&bs, (BackItem){BACK_VISIT, c, NULL});
     
-    while (bs.sp > 0) {
+    while (bs.s.n > 0) {
         BackItem item = back_stack_pop(&bs);
         
         switch (item.type) {
@@ -1366,7 +1278,7 @@ static SKITerm *stg_to_term(SKIPool *pool, Closure *c) {
         
         case BACK_P2_X_DONE: {
             /* x done, save and do y */
-            bs.items[bs.sp - 1].left_result = result;
+            STACK_TOP(&bs.s, BackItem).left_result = result;
             back_stack_push(&bs, (BackItem){BACK_VISIT, item.closure->payload.s2.y, NULL});
             break;
         }
@@ -1380,7 +1292,7 @@ static SKITerm *stg_to_term(SKIPool *pool, Closure *c) {
         
         case BACK_AP_LEFT_DONE: {
             /* f done, save and do arg */
-            bs.items[bs.sp - 1].left_result = result;
+            STACK_TOP(&bs.s, BackItem).left_result = result;
             back_stack_push(&bs, (BackItem){BACK_VISIT, item.closure->payload.ap.arg, NULL});
             break;
         }
@@ -1421,11 +1333,12 @@ static int in_from_space(STG *stg, Closure *p) {
 static Closure *gc_copy(STG *stg, Closure *from, Closure **to_hp) {
     if (!from) return NULL;
     
-    /* The singletons at the start of the from-space are rebuilt at the start of the
-     * to-space, and every space keeps them, so a pointer to one stays valid as it is */
-    {
-        char *base = (char*)stg->space[stg->active_space];
-        if ((char*)from >= base && (char*)from < base + SINGLETON_WORDS * WORD) return from;
+    /* The singletons at the start of every space are rebuilt at the start of the to-space: a pointer to one, in
+     * either space, becomes the same singleton there (so the old spaces can go when the heap grows) */
+    for (int sp_i = 0; sp_i < 2; sp_i++) {
+        char *base = (char*)stg->space[sp_i];
+        if ((char*)from >= base && (char*)from < base + SINGLETON_WORDS * WORD)
+            return (Closure*)((char*)stg->gc_to + ((char*)from - base));
     }
     
     /* If not in from-space, don't copy (shouldn't happen) */
@@ -1469,14 +1382,13 @@ static void gc_scavenge(STG *stg, Closure *c, Closure **to_hp) {
 /*
  * Cheney's algorithm - the main GC loop
  */
-static void stg_gc(STG *stg) {
+/* copy the live data out of the active space into to_base (a space of at least the live size); the caller makes
+   to_base the active space */
+static void stg_collect(STG *stg, Closure *to_base) {
     stg->gc_count++;
     stg->bytes_copied = 0;
     
-    int from_space = stg->active_space;
-    int to_space = 1 - from_space;
-    
-    Closure *to_base = stg->space[to_space];
+    stg->gc_to = to_base;
     Closure *to_hp = to_base;  /* allocation pointer in to-space */
     Closure *scan = to_base;    /* scan pointer for scavenging */
     
@@ -1509,8 +1421,8 @@ static void stg_gc(STG *stg) {
     
     /* Copy roots: pending normalizer work items */
     if (stg->ws_root) {
-        for (size_t i = 0; i < stg->ws_root->sp; i++) {
-            WorkItem *w = &stg->ws_root->items[i];
+        for (size_t i = 0; i < stg->ws_root->s.n; i++) {
+            WorkItem *w = &STACK_AT(&stg->ws_root->s, WorkItem, i);
             w->closure = gc_copy(stg, w->closure, &to_hp);
             w->saved_x = gc_copy(stg, w->saved_x, &to_hp);
         }
@@ -1518,8 +1430,8 @@ static void stg_gc(STG *stg) {
     
     /* Copy roots: pending term_to_stg conversion items */
     if (stg->cs_root) {
-        for (size_t i = 0; i < stg->cs_root->sp; i++) {
-            ConvItem *ci = &stg->cs_root->items[i];
+        for (size_t i = 0; i < stg->cs_root->s.n; i++) {
+            ConvItem *ci = &STACK_AT(&stg->cs_root->s, ConvItem, i);
             ci->left_result = gc_copy(stg, ci->left_result, &to_hp);
         }
     }
@@ -1531,16 +1443,38 @@ static void stg_gc(STG *stg) {
         scan = (Closure*)((char*)scan + size * WORD);
     }
     
-    /* Swap spaces */
-    stg->active_space = to_space;
     stg->hp = to_hp;
-    stg->heap_end = (Closure*)((char*)to_base + stg->heap_size);
     
 #if 0
     size_t used = (char*)to_hp - (char*)to_base;
     fprintf(stderr, "GC #%llu: copied %llu bytes, %zu bytes used\n", 
             stg->gc_count, stg->bytes_copied, used);
 #endif
+}
+static void stg_gc(STG *stg) {
+    int to_space = 1 - stg->active_space;
+    stg_collect(stg, stg->space[to_space]);
+    stg->active_space = to_space;
+    stg->heap_end = (Closure*)((char*)stg->space[to_space] + stg->heap_size);
+}
+
+/* After a collection the live data and the pending request must fit in half a space - or the next collection comes
+ * at once, and the one after. Otherwise both spaces double until they do, and the live data moves into the new pair.
+ * The only limit is the memory layer's. */
+static void stg_make_room(STG *stg, size_t need_bytes) {
+    size_t live = (size_t)((char*)stg->hp - (char*)stg->space[stg->active_space]);
+    if ((live + need_bytes) * 2 <= stg->heap_size) return;
+    size_t size = stg->heap_size;
+    while ((live + need_bytes) * 2 > size) {
+        if (size > SIZE_MAX / 4) resource_die("STG: a heap of %zu live bytes", live + need_bytes);
+        size *= 2;
+    }
+    Closure *a = rmalloc(size), *b = rmalloc(size);
+    stg_collect(stg, a);
+    free(stg->space[0]); free(stg->space[1]);
+    stg->space[0] = a; stg->space[1] = b; stg->active_space = 0;
+    stg->heap_size = size;
+    stg->heap_end = (Closure*)((char*)a + size);
 }
 
 /*
@@ -1674,12 +1608,8 @@ int stg_run_io(SKIPool *pool, SKITerm *prog, const u8 *data, size_t len) {
     /* The whole input stream is built inside one reserved block, so no
      * collection can run while C locals point into it. */
     size_t words = 2 + 12 + 256 * 3 + 3 + 15 * len + 15 + 3;
-    if (words + 64 > stg->heap_size / WORD) {
-        fprintf(stderr, "io: input too large for the STG heap (%zu bytes)\n", len);
-        return 1;
-    }
     stg->extra_roots[0] = P;
-    stg_reserve(stg, (int)words);
+    stg_reserve(stg, words);   /* the heap grows to hold it */
     P = stg->extra_roots[0];
     stg->extra_roots[0] = NULL;
     

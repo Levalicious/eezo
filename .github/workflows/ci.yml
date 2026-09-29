@@ -10,7 +10,7 @@ jobs:
         with:
           path: eezo            # this repository beside its dependencies: the workspace layout the mkfiles assume (../libeezo, ...)
       - uses: Levalicious/mk@8b33eaa94d5ae53a70b0f3b2cfd9fb1432f8cc9e
-      - uses: Levalicious/mkroot@36d0977adb014e0e2775222d23ce522ddde8b570
+      - uses: Levalicious/mkroot@f7addbfe0a8b91de9ef1e0247453f058e3d3fc3a
       - name: dependencies at the commits deps.lock pins
         run: sh eezo/ci/deps.sh
       - name: build, dependencies first

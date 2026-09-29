@@ -1,4 +1,4 @@
-#include <libeezo/res.h>
+#include <libeezo/mem.h>
 /*
  * main.c - Eezo evaluator
  *
@@ -48,7 +48,6 @@ static void usage(const char *prog) {
 static u8 *read_bits(FILE *f, u64 *out_nbits) {
     size_t cap = 8192;
     u8 *bits = rmalloc(cap);
-    if (!bits) return NULL;
     
     u64 nbits = 0;
     int c;
@@ -57,12 +56,7 @@ static u8 *read_bits(FILE *f, u64 *out_nbits) {
         if (c == '0' || c == '1') {
             if (nbits >= cap * 8) {
                 cap *= 2;
-                u8 *newbits = rrealloc(bits, cap);
-                if (!newbits) {
-                    free(bits);
-                    return NULL;
-                }
-                bits = newbits;
+                bits = rrealloc(bits, cap);
             }
             u64 byte_idx = nbits / 8;
             int bit_idx = 7 - (nbits % 8);
@@ -77,77 +71,28 @@ static u8 *read_bits(FILE *f, u64 *out_nbits) {
     return bits;
 }
 
-/* Output result in specified format */
+/* Output result in specified format: the bits, emitted into the growable buffer (bcl.h), as ASCII */
 static void output_result(SKITerm *term, Format fmt) {
-    if (fmt == FMT_BCL || fmt == FMT_XBCL) {
-        u64 size_bits = fmt == FMT_XBCL ? xbcl_size(term) : bcl_size(term);
-        u32 buf_size = (size_bits + 7) / 8 + 8;
-        u8 *buf = rmalloc(buf_size);
-        if (!buf) {
-            fprintf(stderr, "resource limit: out of memory\n");
-            return;
-        }
-        memset(buf, 0, buf_size);
-        
-        BclBuffer bb;
-        bcl_buffer_init(&bb, buf, buf_size * 8);
-        if (fmt == FMT_XBCL ? xbcl_emit(term, &bb) : bcl_emit(term, &bb)) {
-            i32 bits = (i32)bcl_buffer_len(&bb);
-            for (int b = 0; b < bits; b++) {
-                int byte_idx = b / 8;
-                int bit_idx = 7 - (b % 8);
-                printf("%d", (buf[byte_idx] >> bit_idx) & 1);
-            }
-            printf("\n");
-        } else {
-            fprintf(stderr, "BCL emission failed\n");
-        }
-        free(buf);
-    } else if (fmt == FMT_JOT) {
-        u64 size_bits = jot_size(term);
-        u32 buf_size = (size_bits + 7) / 8 + 8;
-        u8 *buf = rmalloc(buf_size);
-        if (!buf) {
-            fprintf(stderr, "resource limit: out of memory\n");
-            return;
-        }
-        memset(buf, 0, buf_size);
-        
-        i32 bits = jot_emit(term, buf, buf_size);
-        if (bits > 0) {
-            for (int b = 0; b < bits; b++) {
-                int byte_idx = b / 8;
-                int bit_idx = 7 - (b % 8);
-                printf("%d", (buf[byte_idx] >> bit_idx) & 1);
-            }
-            printf("\n");
-        } else {
-            fprintf(stderr, "Jot emission failed\n");
-        }
-        free(buf);
-    } else if (fmt == FMT_JOMPLEMENT) {
-        u64 size_bits = jot_size(term);
-        u32 buf_size = (size_bits + 7) / 8 + 8;
-        u8 *buf = rmalloc(buf_size);
-        if (!buf) {
-            fprintf(stderr, "resource limit: out of memory\n");
-            return;
-        }
-        memset(buf, 0, buf_size);
-        
-        i32 bits = jomplement_emit(term, buf, buf_size);
-        if (bits > 0) {
-            for (int b = 0; b < bits; b++) {
-                int byte_idx = b / 8;
-                int bit_idx = 7 - (b % 8);
-                printf("%d", (buf[byte_idx] >> bit_idx) & 1);
-            }
-            printf("\n");
-        } else {
-            fprintf(stderr, "Jomplement emission failed\n");
-        }
-        free(buf);
+    BclBuffer bb;
+    bcl_buffer_init(&bb);
+    bool ok = fmt == FMT_XBCL ? xbcl_emit(term, &bb)
+            : fmt == FMT_BCL ? bcl_emit(term, &bb)
+            : fmt == FMT_JOT ? jot_emit(term, &bb)
+            : jomplement_emit(term, &bb);
+    if (ok) {
+        const u8 *buf = bcl_buffer_data(&bb);
+        for (u64 b = 0; b < bcl_buffer_len(&bb); b++) putchar('0' + ((buf[b / 8] >> (7 - b % 8)) & 1));
+        printf("\n");
+    } else {
+        fprintf(stderr, "%s emission failed\n", fmt == FMT_XBCL || fmt == FMT_BCL ? "BCL" : fmt == FMT_JOT ? "Jot" : "Jomplement");
     }
+    bcl_buffer_drop(&bb);
+}
+
+/* The term onto the JIT's heap. The native runtime's heaps are 32 bits wide (their sizes): a term needing more is
+   past that width, reported as the resource limit it is */
+static void native_jit_load_or_die(NativeJIT *jit, SKITerm *term) {
+    if (native_jit_load_term(jit, term) != 0) resource_die("the term needs a heap past the native runtime's 4 GB width");
 }
 
 int main(int argc, char **argv) {
@@ -155,6 +100,7 @@ int main(int argc, char **argv) {
        of SIGPIPE (exit 141). A CI runner's shell ignores SIGPIPE, and an inherited SIG_IGN turned the death into an
        endless loop of failed writes (the io suite's 'ones', 2026-09-28). */
     signal(SIGPIPE, SIG_DFL);
+    mem_init("eezo", "EEZO_MAX_ALLOC");   /* the one memory layer (libeezo/mem.h): its failure path and budget */
     Format fmt = FMT_BCL;
     int use_simple = 0;
     int io_mode = 0;
@@ -256,7 +202,7 @@ int main(int argc, char **argv) {
     
     /* Initialize term pool */
     SKIPool pool;
-    pool_init(&pool, 1000000);
+    ski_pool_init(&pool);
     
     /* Parse input */
     BclStream s;
@@ -286,7 +232,7 @@ int main(int argc, char **argv) {
     
     if (!term) {
         fprintf(stderr, "Parse failed\n");
-        pool_free(&pool);
+        ski_pool_drop(&pool);
         return 1;
     }
     
@@ -300,21 +246,19 @@ int main(int argc, char **argv) {
     if (monad_mode) {
         int rc;
         if (use_native) {
-            u32 code_cap = 64 * 1024;
-            u8 *code_buf = rmalloc(code_cap);
             NativeEmit e;
-            native_emit_init(&e, code_buf, code_cap, OUTPUT_BCL);
+            native_emit_init(&e, OUTPUT_BCL);
             e.io_mode = 2;
             native_emit_runtime(&e);
             NativeJIT *jit = native_jit_prepare(&e, heap_size);
-            if (!jit || native_jit_load_term(jit, term) != 0) { fprintf(stderr, "JIT preparation failed\n"); rc = 1; }
-            else rc = native_jit_run(jit);            /* the child performs the actions itself */
+            native_jit_load_or_die(jit, term);
+            rc = native_jit_run(jit);            /* the child performs the actions itself */
             native_jit_free(jit);
-            free(code_buf);
+            native_emit_drop(&e);
         }
         else if (use_simple) rc = io_run_monad_simple(&pool, term);
         else rc = stg_run_monad(&pool, term);
-        pool_free(&pool);
+        ski_pool_drop(&pool);
         return rc;
     }
 
@@ -327,29 +271,22 @@ int main(int argc, char **argv) {
         /* the native child reads stdin itself; the C drivers take it here */
         if (!use_native) data = io_read_all_stdin(&data_len);
         if (use_native) {
-            u32 code_cap = 64 * 1024;
-            u8 *code_buf = rmalloc(code_cap);
             NativeEmit e;
-            native_emit_init(&e, code_buf, code_cap, OUTPUT_BCL);
+            native_emit_init(&e, OUTPUT_BCL);
             e.io_mode = 1;
             native_emit_runtime(&e);
             NativeJIT *jit = native_jit_prepare(&e, heap_size);
-            if (!jit || native_jit_load_term(jit, term) != 0) {
-                fprintf(stderr, "JIT preparation failed\n");
-                rc = 1;
-            } else {
-                /* the child reads the data from stdin itself */
-                rc = native_jit_run(jit);
-            }
+            native_jit_load_or_die(jit, term);
+            rc = native_jit_run(jit);   /* the child reads the data from stdin itself */
             native_jit_free(jit);
-            free(code_buf);
+            native_emit_drop(&e);
         } else if (use_simple) {
             rc = io_run_simple(&pool, term, data, data_len);
         } else {
             rc = stg_run_io(&pool, term, data, data_len);
         }
         free(data);
-        pool_free(&pool);
+        ski_pool_drop(&pool);
         return rc;
     }
     
@@ -360,42 +297,19 @@ int main(int argc, char **argv) {
     if (use_native) {
         if (verbose) fprintf(stderr, "Using native JIT...\n");
         
-        /* Allocate code buffer */
-        u32 code_cap = 64 * 1024;
-        u8 *code_buf = rmalloc(code_cap);
-        if (!code_buf) {
-            fprintf(stderr, "resource limit: out of memory\n");
-            pool_free(&pool);
-            return 1;
-        }
-        
         /* Initialize and emit runtime */
         NativeEmit e;
         OutputFormat native_fmt = OUTPUT_BCL;
         if (fmt == FMT_JOT) native_fmt = OUTPUT_JOT;
         else if (fmt == FMT_JOMPLEMENT) native_fmt = OUTPUT_JOMPLEMENT;
         else if (fmt == FMT_XBCL) native_fmt = OUTPUT_XBCL;
-        native_emit_init(&e, code_buf, code_cap, native_fmt);
+        native_emit_init(&e, native_fmt);
         e.nf_mode = whnf ? 0 : 1;
         native_emit_runtime(&e);
         
-        /* Prepare JIT */
+        /* Prepare JIT, load term onto heap */
         NativeJIT *jit = native_jit_prepare(&e, heap_size);
-        if (!jit) {
-            fprintf(stderr, "JIT preparation failed\n");
-            free(code_buf);
-            pool_free(&pool);
-            return 1;
-        }
-        
-        /* Load term onto heap */
-        if (native_jit_load_term(jit, term) != 0) {
-            fprintf(stderr, "resource limit: term too large for heap\n");
-            native_jit_free(jit);
-            free(code_buf);
-            pool_free(&pool);
-            return 1;
-        }
+        native_jit_load_or_die(jit, term);
         
         /* Run - forks, child executes and exits */
         int exit_status = native_jit_run(jit);
@@ -405,9 +319,9 @@ int main(int argc, char **argv) {
         }
         
         native_jit_free(jit);
-        free(code_buf);
+        native_emit_drop(&e);
         ski_unref(&pool, term);
-        pool_free(&pool);
+        ski_pool_drop(&pool);
         
         /* Native JIT handles its own output, we just return the exit status */
         return exit_status;
@@ -433,6 +347,6 @@ int main(int argc, char **argv) {
     output_result(result, fmt);
     
     ski_unref(&pool, result);
-    pool_free(&pool);
+    ski_pool_drop(&pool);
     return 0;
 }
