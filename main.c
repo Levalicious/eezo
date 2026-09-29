@@ -89,10 +89,9 @@ static void output_result(SKITerm *term, Format fmt) {
     bcl_buffer_drop(&bb);
 }
 
-/* The term onto the JIT's heap. The native runtime's heaps are 32 bits wide (their sizes): a term needing more is
-   past that width, reported as the resource limit it is */
+/* The term onto the JIT's heap (sized to it: running out is the memory layer's resource abort) */
 static void native_jit_load_or_die(NativeJIT *jit, SKITerm *term) {
-    if (native_jit_load_term(jit, term) != 0) resource_die("the term needs a heap past the native runtime's 4 GB width");
+    if (native_jit_load_term(jit, term) != 0) resource_die("the term could not be loaded onto the JIT's heap");
 }
 
 int main(int argc, char **argv) {
@@ -109,7 +108,7 @@ int main(int argc, char **argv) {
     int use_native = 0;
     int verbose = 0;
     int whnf = 0;
-    u32 heap_size = NATIVE_DEFAULT_HEAP_SIZE;
+    u64 heap_size = NATIVE_DEFAULT_HEAP_SIZE;
     
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
@@ -131,7 +130,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Missing argument for -H\n");
                 return 1;
             }
-            heap_size = (u32)strtoul(argv[i], NULL, 0);
+            heap_size = (u64)strtoull(argv[i], NULL, 0);
             if (heap_size < 4096) {
                 fprintf(stderr, "Heap size too small: %s\n", argv[i]);
                 return 1;
